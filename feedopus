@@ -26,6 +26,7 @@ import unicodedata
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -62,6 +63,7 @@ DEFAULTS = {
     "windows_filenames": "true",
     "require_tag": "",
     "feeds_file": "",
+    "keep_episodes": "30",
 }
 
 # Hosts imported from a newsboat urls file. Blogs and distro news stay out.
@@ -229,6 +231,9 @@ feeds_file = {feeds_file}
 
 # If set, only lines carrying this tag are used.
 require_tag =
+
+# clean leaves this many newest audio files in the output folder.
+keep_episodes = 30
 """
 
 
@@ -1043,6 +1048,33 @@ def opus_files(root: Path) -> set[Path]:
     return {path for path in root.rglob("*.opus") if path.is_file()}
 
 
+def audio_episodes(root: Path) -> list[Path]:
+    """Audio files in the output folder. Hidden names and symlinks are left out."""
+    if not root.is_dir():
+        return []
+    found: list[Path] = []
+    for path in root.rglob("*"):
+        if not path.is_file() or path.is_symlink() or path.name.startswith("."):
+            continue
+        relative = path.relative_to(root)
+        if any(part.startswith(".") for part in relative.parts):
+            continue
+        if path.suffix.lower() not in AUDIO_EXTENSIONS:
+            continue
+        found.append(path)
+    return found
+
+
+def episodes_past_keep(paths: list[Path], keep: int) -> list[Path]:
+    """Oldest files once the newest `keep` are set aside. Oldest first."""
+    ordered = sorted(paths, key=lambda path: (path.stat().st_mtime, path.name))
+    if keep <= 0:
+        return ordered
+    if len(ordered) <= keep:
+        return []
+    return ordered[:-keep]
+
+
 def clean_temp(temp: Path, max_age_days: int = 7) -> None:
     """Drop abandoned partial downloads. Fresh ones stay so yt-dlp can resume."""
     if not temp.exists():
@@ -1600,6 +1632,33 @@ def acquire_lock(state_dir: Path):
         log("feedopus is already running")
         return None
     return handle
+
+
+def cmd_clean(args: argparse.Namespace, config_dir: Path, state_dir: Path) -> int:
+    """Delete the oldest audio files, leaving the newest keep_episodes."""
+    cfg = load_config(config_dir / "config")
+    output_dir = checked_output(cfg, args.output_dir)
+    keep = args.keep if args.keep is not None else as_int(cfg.get("keep_episodes", "30"), "keep_episodes")
+    if keep < 0:
+        raise SystemExit("--keep must be 0 or more")
+    lock = acquire_lock(state_dir)
+    if lock is None:
+        return 0
+    try:
+        if not output_dir.is_dir():
+            log(f"no output folder at {pretty(str(output_dir))}")
+            return 0
+        episodes = audio_episodes(output_dir)
+        doomed = episodes_past_keep(episodes, keep)
+        verb = "would remove" if args.dry_run else "removed"
+        for path in doomed:
+            if not args.dry_run:
+                path.unlink()
+            log(f"{verb:12} {pretty(str(path))}")
+        log(f"kept {len(episodes) - len(doomed)}, {verb} {len(doomed)}")
+        return 0
+    finally:
+        lock.close()
 
 
 def cmd_list(config_dir: Path) -> int:
@@ -2192,6 +2251,22 @@ def cmd_self_test() -> int:
         names["fetch_bytes"] = saved_fetch
         names["fetch_subscription"] = saved_sub
         names["LOG_PATH"] = saved_log
+    library = Path(tempfile.mkdtemp(prefix="feedopus-clean-"))
+    try:
+        stamps = {"old.opus": 10, "mid.opus": 20, "new.opus": 30, "same-a.opus": 40, "same-b.opus": 40}
+        for name, stamp in stamps.items():
+            path = library / name
+            path.write_bytes(b"x")
+            os.utime(path, (stamp, stamp))
+        (library / "notes.txt").write_text("leave me")
+        (library / ".hidden.opus").write_bytes(b"h")
+        found = audio_episodes(library)
+        check("clean sees audio", sorted(path.name for path in found) == ["mid.opus", "new.opus", "old.opus", "same-a.opus", "same-b.opus"])
+        check("clean oldest", [path.name for path in episodes_past_keep(found, 3)] == ["old.opus", "mid.opus"])
+        check("clean keeps all", episodes_past_keep(found, 30) == [])
+        check("clean keep zero", [path.name for path in episodes_past_keep(found, 0)] == ["old.opus", "mid.opus", "new.opus", "same-a.opus", "same-b.opus"])
+    finally:
+        shutil.rmtree(library)
     return 1 if failed else 0
 
 
@@ -2204,6 +2279,8 @@ examples:
   feedopus init                write config and import newsboat video feeds
   feedopus list                show the selected feeds
   feedopus status              show what has been remembered
+  feedopus clean --dry-run     show the oldest episodes that clean would delete
+  feedopus clean --keep 30     delete older audio, leaving the 30 newest files
   feedopus install-timer       check about every two hours on Linux
 
 files:
@@ -2289,6 +2366,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("list", parents=[common], help="show the selected feeds")
     sub.add_parser("status", parents=[common], help="show remembered items")
+    clean = sub.add_parser(
+        "clean",
+        parents=[common],
+        help="delete the oldest audio files in the output folder",
+        description=(
+            "Delete the oldest audio files in the output folder, leaving the newest ones. "
+            "Remembered episodes stay remembered, so a removed file is not downloaded again."
+        ),
+    )
+    clean.add_argument("--dry-run", action="store_true", help="print the files that would be deleted")
+    clean.add_argument(
+        "--keep",
+        type=int,
+        metavar="N",
+        help="leave this many newest episodes (default: keep_episodes, 30)",
+    )
+    clean.add_argument("--output-dir", metavar="DIR", help="clean this folder instead of output_dir")
     sub.add_parser("install-timer", help="enable a systemd user timer that checks about every two hours")
     sub.add_parser("remove-timer", help="disable and remove the systemd user timer")
     sub.add_parser("install-docs", help="install the manual page and the tldr page")
@@ -2314,6 +2408,8 @@ def main(argv: list[str]) -> int:
         return cmd_list(config_dir)
     if args.cmd == "status":
         return cmd_status(state_dir)
+    if args.cmd == "clean":
+        return cmd_clean(args, config_dir, state_dir)
     if args.cmd == "install-timer":
         return cmd_install_timer()
     if args.cmd == "remove-timer":

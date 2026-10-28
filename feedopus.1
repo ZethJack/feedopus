@@ -77,6 +77,17 @@ Print the selected feeds.
 .B status
 Print how many items are remembered, grouped as downloaded, skipped, seen, deferred, and error.
 .TP
+.B clean
+Delete the oldest audio files in the output folder.
+The newest
+.B keep_episodes
+files stay (default 30).
+.B \-\-keep N
+uses N for this run.
+.B \-\-dry\-run
+lists the files that would be deleted and removes nothing.
+A removed file stays remembered, so it is not downloaded again.
+.TP
 .B install\-timer
 Write and enable a systemd user timer that runs about every two hours, at :20 past even hours.
 It does not start the timer.
@@ -341,6 +352,16 @@ inside the config directory.
 .B require_tag
 When set, only feed lines that carry this tag are used.
 Empty uses every line.
+.TP
+.B keep_episodes
+How many of the newest audio files
+.B clean
+leaves in the output folder.
+Default:
+.IR 30 .
+Older audio files are the ones removed.
+.B 0
+removes every audio file in that folder.
 .SH "FIRST VISIT"
 The first time a feed is read, only items newer than
 .B since_days
@@ -422,6 +443,8 @@ feedopus grab 'https://www.youtube.com/watch?v=VIDEO_ID'
 feedopus init
 feedopus list
 feedopus status
+feedopus clean \-\-dry\-run
+feedopus clean \-\-keep 30
 feedopus install\-timer
 systemctl \-\-user start feedopus.timer
 feedopus install\-docs

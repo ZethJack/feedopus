@@ -26,6 +26,10 @@ That directory is the other machine's `~/.local/state/feedopus`. `state.json` an
 
 Running `./install-linux` again replaces `~/.local/bin/feedopus`, the manual, the tldr page, and the timer unit. Config, the feed list, and remembered episodes stay as they are.
 
+## Disk space
+
+`feedopus clean` deletes the oldest audio files in the output folder and leaves the 30 newest. `feedopus clean --dry-run` lists those files and deletes nothing. `feedopus clean --keep 20` keeps 20 for that run. Set `keep_episodes` in the config to change the default. A removed file stays remembered, so it is not downloaded again.
+
 ## Source package
 
 The git tree for this machine is `~/.local/src/feedopus`. From that directory:

@@ -36,6 +36,14 @@
 
 `feedopus status`
 
+- List the oldest episodes that would be deleted, leaving the newest 30:
+
+`feedopus clean --dry-run`
+
+- Delete older audio and keep a chosen number of the newest files:
+
+`feedopus clean --keep {{count}}`
+
 - Enable a timer that checks about every two hours (Linux):
 
 `feedopus install-timer && systemctl --user start feedopus.timer`
