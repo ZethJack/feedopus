@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Zeth <zeth@zethjack.eu>
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Download new videos from selected feeds as Opus audio.
 
 Reads a feed list. YouTube channel feeds are read as RSS, and the uploads
@@ -7,8 +9,9 @@ are read directly, and a channel or playlist URL is read with yt-dlp.
 Livestreams and archived livestreams (stream VODs) are not saved. Regular
 uploads are extracted with yt-dlp and ffmpeg to Opus.
 
-The same script runs on Linux and in Termux on Android. It needs python3,
-yt-dlp, and an ffmpeg build with libopus.
+Runs on Linux. It needs python3, yt-dlp, and an ffmpeg build with libopus.
+This program is free software under the GNU GPL, version 3 or later.
+See the LICENSE file.
 """
 
 from __future__ import annotations
@@ -123,16 +126,7 @@ def default_state_dir() -> Path:
 
 
 def default_output_dir() -> Path:
-    sync = Path.home() / "Sync" / "podcast"
-    if sync.is_dir():
-        return sync
-    music = Path.home() / "storage" / "music"
-    if music.is_dir():
-        return music / "podcast"
-    shared = Path.home() / "storage" / "shared"
-    if shared.is_dir():
-        return shared / "podcast"
-    return sync
+    return Path.home() / "Sync" / "podcast"
 
 
 def expand(value: str) -> str:
@@ -220,7 +214,7 @@ cookies =
 # Extra arguments appended to every yt-dlp download, in shell syntax.
 extra_args =
 
-# Notify when a run saves files or hits errors (notify-send or Termux).
+# Notify when a run saves files or hits errors (notify-send).
 notify = true
 
 # Avoid characters that phone storage and SD cards reject.
@@ -1003,7 +997,7 @@ def require_tools() -> None:
         raise SystemExit(
             "missing required program: "
             + ", ".join(missing)
-            + ". On Termux: pkg install python ffmpeg && pip install -U yt-dlp"
+            + ". Install yt-dlp and an ffmpeg build with libopus."
         )
     proc = subprocess.run(
         ["ffmpeg", "-hide_banner", "-encoders"],
@@ -1534,20 +1528,6 @@ def notify(title: str, body: str, enabled: bool) -> None:
             timeout=10,
         )
         return
-    if shutil.which("termux-notification"):
-        subprocess.run(
-            ["termux-notification", "--title", title, "--content", body, "--id", "feedopus"],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-        )
-
-
-def wake(lock: bool) -> None:
-    command = "termux-wake-lock" if lock else "termux-wake-unlock"
-    if shutil.which(command):
-        subprocess.run([command], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def pause(seconds: int) -> None:
@@ -1722,7 +1702,6 @@ def cmd_grab(args: argparse.Namespace, config_dir: Path, state_dir: Path) -> int
         )
         now = datetime.now(timezone.utc)
         seen = load_seen(state, output_dir)
-        wake(True)
         result = process_entry(entry, state, cfg, output_dir, state_dir, cookies, seen, now, args.dry_run)
         if result.status == "downloaded" and not args.dry_run:
             # The feed title was the URL. Keep yt-dlp's filename, and store the URL title
@@ -1740,7 +1719,6 @@ def cmd_grab(args: argparse.Namespace, config_dir: Path, state_dir: Path) -> int
             log(f"{result.status:<10} {args.url} ({result.detail})")
         return 0 if result.status != "error" else 1
     finally:
-        wake(False)
         lock.close()
 
 
@@ -1765,11 +1743,9 @@ def cmd_run(args: argparse.Namespace, config_dir: Path, state_dir: Path) -> int:
     if lock is None:
         return 0
     clean_temp(state_dir / "tmp")
-    wake(True)
     try:
         return run_locked(args, cfg, feeds, output_dir, state_dir, cookies)
     finally:
-        wake(False)
         lock.close()
 
 
@@ -1998,7 +1974,7 @@ def cmd_install_docs() -> int:
 
 def cmd_install_timer() -> int:
     if not shutil.which("systemctl"):
-        raise SystemExit("systemctl is not available. On Android, use the Termux loop in the README.")
+        raise SystemExit("systemctl is not available.")
     executable = Path("~/.local/bin/feedopus").expanduser()
     if not os.access(executable, os.X_OK):
         executable = Path(__file__).resolve()

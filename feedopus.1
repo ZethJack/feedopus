@@ -52,8 +52,10 @@ except
 and
 .BR \-\-help .
 .PP
-The same program runs on Linux and in Termux on Android.
+It runs on Linux.
 It needs Python 3.11 or newer, yt-dlp, and ffmpeg with libopus.
+.B feedopus
+is free software under the GNU General Public License, version 3 or later.
 .SH COMMANDS
 .TP
 .B run
@@ -212,11 +214,6 @@ entries are considered (default 15).
 Finished audio, unless
 .B output_dir
 says otherwise.
-On Android, if that directory does not exist,
-.I ~/storage/music/podcast
-or
-.I ~/storage/shared/podcast
-is used when present.
 .TP
 .I ~/.local/state/feedopus/state.json
 Items already considered, and which feeds have been caught up.
@@ -334,7 +331,7 @@ Empty by default.
 .TP
 .B notify
 Send a notification when a run saves files or hits errors.
-Uses notify-send, or a Termux notification when that is what is installed.
+Uses notify-send.
 Default:
 .IR true .
 .TP
@@ -418,16 +415,6 @@ If
 names a path that is not on this machine, it is pointed at
 .I ~/.config/feedopus/feeds
 when that file exists.
-.SH ANDROID
-Install Termux, then Python, ffmpeg, and yt-dlp.
-Copy this program onto
-.I $PREFIX/bin
-and copy
-.I ~/.config/feedopus/
-from the computer.
-.B install\-timer
-needs systemd and is the Linux schedule.
-A Termux:Boot loop that sleeps two hours between runs is in the project README.
 .B install\-docs
 installs the manual and the tldr page when those viewers are available.
 The manual, the tldr page, and

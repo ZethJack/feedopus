@@ -2,7 +2,7 @@
 
 Save new videos from the feeds you select as Opus audio. Livestreams, upcoming streams, and archived livestreams are skipped. The thumbnail is stored as cover art inside the file.
 
-Linux and Termux. Requires Python 3.11 or newer, yt-dlp, and ffmpeg with libopus.
+Linux. Requires Python 3.11 or newer, yt-dlp, and ffmpeg with libopus.
 
 ## Install
 
@@ -51,28 +51,6 @@ Files are named from the title, with spaces and punctuation written as underscor
 
 Run it on one device at a time. Two devices that have not synced a finished file will each download a copy.
 
-## Android
-
-Use Termux from F-Droid. This is not a Play Store app.
-
-```
-pkg install python ffmpeg
-pip install -U yt-dlp
-termux-setup-storage
-install -m 755 feedopus "$PREFIX/bin/feedopus"
-```
-
-Copy `~/.config/feedopus/` from the computer. If the phone's Syncthing folder is not `~/Sync/podcast`, set `output_dir` to that folder. Leave the two-hour loop below off while the Linux timer is enabled.
-
-```sh
-#!/data/data/com.termux/files/usr/bin/sh
-termux-wake-lock
-while true; do
-  feedopus run
-  sleep 7200
-done
-```
-
 ## Documentation
 
 ```
@@ -82,3 +60,5 @@ tldr feedopus
 ```
 
 `feedopus install-docs` installs the manual and the tldr page for the current user.
+
+Feedopus is free software under the GNU General Public License, version 3 or later. See `LICENSE`.

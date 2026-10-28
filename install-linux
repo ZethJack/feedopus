@@ -79,7 +79,7 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
-[[ "$(uname -s)" == Linux ]] || die "this script is for Linux. On Android, follow the Termux steps in the README."
+[[ "$(uname -s)" == Linux ]] || die "this script is for Linux."
 [[ -f "$program" ]] || die "feedopus is missing next to this script"
 chmod +x "$program"
 
