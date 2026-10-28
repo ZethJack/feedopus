@@ -59,7 +59,7 @@ https://www.youtube.com/feeds/videos.xml?channel_id=UCxxxx "Channel name"
 https://www.youtube.com/@Channel "Channel name"
 ```
 
-YouTube `feeds/videos.xml?channel_id=UCxxxx` lines are checked from that channel's uploads playlist (`UUxxxx`), because the public RSS host often returns 404 or 500. Other RSS and Atom URLs are read directly. Any other URL is a channel or playlist subscription.
+YouTube `feeds/videos.xml?channel_id=UCxxxx` lines are read as RSS. If that request fails, the channel's uploads playlist (`UUxxxx`) is checked instead. Other RSS and Atom URLs are read directly. Any other URL is a channel or playlist subscription.
 
 `skip_was_live` controls stream archives. Set it to `false` to keep those recordings. A normal video that YouTube premiered is sometimes marked as a past livestream, and is then skipped while `skip_was_live` is true.
 

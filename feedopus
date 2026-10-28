@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Download new videos from selected feeds as Opus audio.
 
-Reads a feed list. YouTube channel feeds are checked from the uploads
-playlist. Other RSS and Atom feeds are read directly, and a channel or
-playlist URL is read with yt-dlp. Livestreams and archived livestreams
-(stream VODs) are not saved. Regular uploads are extracted with yt-dlp
-and ffmpeg to Opus.
+Reads a feed list. YouTube channel feeds are read as RSS, and the uploads
+playlist is checked only when that request fails. Other RSS and Atom feeds
+are read directly, and a channel or playlist URL is read with yt-dlp.
+Livestreams and archived livestreams (stream VODs) are not saved. Regular
+uploads are extracted with yt-dlp and ffmpeg to Opus.
 
 The same script runs on Linux and in Termux on Android. It needs python3,
 yt-dlp, and an ffmpeg build with libopus.
@@ -662,11 +662,10 @@ def parse_feed_xml(data: bytes, feed: Feed) -> list[Entry]:
 
 
 def youtube_listing_url(url: str) -> str | None:
-    """Playlist page for a YouTube Atom feed.
+    """Uploads playlist for a YouTube Atom feed, used when RSS fails.
 
-    feeds/videos.xml often returns 404 or 500. The channel's uploads playlist
-    lists the same recent videos. A channel id UCxxxx uses playlist UUxxxx.
-    Other sites return None and keep their own RSS.
+    A channel id UCxxxx uses playlist UUxxxx. Other sites return None and
+    keep their own RSS.
     """
     parsed = urllib.parse.urlparse(url)
     host = parsed.netloc.lower().removeprefix("www.").removeprefix("m.")
@@ -754,11 +753,15 @@ def fetch_subscription(feed: Feed, playlist_end: int, cookies: str, page_url: st
 
 def fetch_feed(feed: Feed, playlist_end: int, cookies: str) -> list[Entry]:
     listing = youtube_listing_url(feed.url)
-    if listing:
-        return fetch_subscription(feed, playlist_end, cookies, listing)
-    if looks_like_feed(feed.url):
-        data = fetch_bytes(feed.url)
-        return parse_feed_xml(data, feed)
+    if listing or looks_like_feed(feed.url):
+        try:
+            data = fetch_bytes(feed.url)
+            return parse_feed_xml(data, feed)
+        except (urllib.error.URLError, TimeoutError, OSError, RuntimeError, ET.ParseError, ValueError) as exc:
+            if not listing:
+                raise
+            log(f"rss       {feed.name or feed.url} ({one_line(str(exc))}; checking the uploads playlist)")
+            return fetch_subscription(feed, playlist_end, cookies, listing)
     return fetch_subscription(feed, playlist_end, cookies)
 
 
@@ -1548,7 +1551,7 @@ def cmd_init(config_dir: Path, force: bool = False) -> int:
         "# One URL per line. Optional quoted name, then optional tags:",
         '#   https://www.youtube.com/feeds/videos.xml?channel_id=UC... "Name"',
         "#   https://www.youtube.com/@Channel \"Name\"",
-        "# YouTube feeds/videos.xml lines are checked from the uploads playlist.",
+        "# YouTube feeds/videos.xml is read as RSS. If that fails, the uploads playlist is checked.",
         "# Other RSS/Atom URLs are read directly. Any other URL is a channel or playlist.",
         "# Imported video feeds from newsboat. Blogs and distro news were left out.",
         "",
@@ -2148,6 +2151,47 @@ def cmd_self_test() -> int:
         youtube_listing_url("https://peertube.example/feeds/videos.xml?videoChannelId=51") is None,
     )
     check("channel page stays", youtube_listing_url("https://www.youtube.com/@Example") is None)
+    youtube = Feed(
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCIr4vkCsn0tdTW2xZ1jRG1g",
+        "LiberalHivemind",
+        (),
+    )
+    names = globals()
+    saved_fetch = names["fetch_bytes"]
+    saved_sub = names["fetch_subscription"]
+    saved_log = names["LOG_PATH"]
+    names["LOG_PATH"] = None
+    called: list[str] = []
+
+    def record_listing(feed: Feed, playlist_end: int, cookies: str, page_url: str = "") -> list[Entry]:
+        called.append(page_url)
+        return []
+
+    try:
+        names["fetch_bytes"] = lambda url: atom
+        names["fetch_subscription"] = record_listing
+        rss_entries = fetch_feed(youtube, 15, "")
+        check("rss first", len(rss_entries) == 1 and rss_entries[0].id == "yt:abcdefghijk" and not called)
+
+        def broken_feed(url: str) -> bytes:
+            raise urllib.error.URLError("404")
+
+        names["fetch_bytes"] = broken_feed
+        fetch_feed(youtube, 15, "")
+        check(
+            "playlist fallback",
+            called == ["https://www.youtube.com/playlist?list=UUIr4vkCsn0tdTW2xZ1jRG1g"],
+        )
+        peer = Feed("https://peertube.example/feeds/videos.xml?videoChannelId=51", "Peer", ())
+        try:
+            fetch_feed(peer, 15, "")
+            check("other rss has no playlist fallback", False)
+        except urllib.error.URLError:
+            check("other rss has no playlist fallback", called == ["https://www.youtube.com/playlist?list=UUIr4vkCsn0tdTW2xZ1jRG1g"])
+    finally:
+        names["fetch_bytes"] = saved_fetch
+        names["fetch_subscription"] = saved_sub
+        names["LOG_PATH"] = saved_log
     return 1 if failed else 0
 
 

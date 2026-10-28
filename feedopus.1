@@ -183,14 +183,15 @@ https://www.youtube.com/@Channel "Channel name"
 An optional tag may follow the name.
 A YouTube address of the form
 .I feeds/videos.xml?channel_id=UCxxxx
-is read from that channel's uploads playlist, the same id with
+is read as RSS.
+If that request fails, the channel's uploads playlist is checked instead,
+the same id with
 .B UC
 changed to
 .BR UU .
-The public RSS host often returns 404 or 500.
 A
 .I playlist_id
-on that host is read as that playlist.
+on that host is read as that playlist when RSS fails.
 Other RSS and Atom URLs are read directly.
 Any other URL is treated as a channel or playlist, and only the newest
 .B playlist_end
