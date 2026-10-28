@@ -1,96 +1,68 @@
 # feedopus
 
-Checks the feeds you select and saves new uploads as Opus audio. Livestreams, upcoming streams, and archived livestreams (stream VODs) are skipped.
+Save new videos from the feeds you select as Opus audio. Livestreams, upcoming streams, and archived livestreams are skipped. The thumbnail is stored as cover art inside the file.
 
-Works on Linux and in Termux on Android. Needs Python 3.11 or newer, yt-dlp, and ffmpeg with libopus.
+Linux and Termux. Requires Python 3.11 or newer, yt-dlp, and ffmpeg with libopus.
 
-## Install on Linux
+## Install
 
-Copy this directory to the machine, then:
+From a clone or an unpacked source tarball:
 
 ```
 ./install-linux
-```
-
-That copies `feedopus` into `~/.local/bin` (overwriting any existing copy), installs Python 3.11+, ffmpeg with libopus, and yt-dlp when they are missing, writes a config if you do not have one, installs the manual, and enables the two-hour timer. It does not start the timer. Start it with `systemctl --user start feedopus.timer`.
-
-An existing config and feed list are left in place. If `feeds_file` names a path that is not on this machine, and `~/.config/feedopus/feeds` exists, that setting is updated.
-
-To keep the memory of episodes already heard on another computer:
-
-```
-./install-linux --state-from /path/to/old/feedopus-state
-```
-
-That directory is the other machine's `~/.local/state/feedopus`. `state.json` and `archive.txt` are copied only when this user does not already have them. `--start` starts the timer immediately.
-
-Running `./install-linux` again replaces `~/.local/bin/feedopus`, the manual, the tldr page, and the timer unit. Config, the feed list, and remembered episodes stay as they are.
-
-## Disk space
-
-`feedopus clean` deletes the oldest audio files in the output folder and leaves the 30 newest. `feedopus clean --dry-run` lists those files and deletes nothing. `feedopus clean --keep 20` keeps 20 for that run. Set `keep_episodes` in the config to change the default. A removed file stays remembered, so it is not downloaded again.
-
-## Source package
-
-The git tree for this machine is `~/.local/src/feedopus`. From that directory:
-
-```
-./dist
-```
-
-That writes `feedopus-VERSION.tar.gz` from the latest commit. Unpack it on another Linux machine and run `./install-linux` there. The tarball does not contain your config, feed list, or episode memory.
-
-## Desktop
-
-```
-feedopus init          # writes ~/.config/feedopus/ and imports video feeds from newsboat
-feedopus run --dry-run
-feedopus               # download
-feedopus install-timer # about every two hours
 systemctl --user start feedopus.timer
 ```
 
-Finished files go to `~/Sync/podcast`, with the video thumbnail embedded as cover art. Partial downloads stay in `~/.local/state/feedopus/tmp`, so Syncthing does not sync a half-written file.
+`./install-linux` copies the program to `~/.local/bin/feedopus`, installs any missing dependencies, writes a config if you have none, installs the manual, and enables a timer that runs about every two hours. It does not start the timer. Running it again replaces the program, the manual, and the timer unit. Config, the feed list, and remembered episodes stay in place.
 
-The first time a feed is read, only items from the last `since_days` (default 2) are downloaded. Older items are remembered and left alone. After that, anything new in the feed is downloaded. `feedopus run --backfill 3` takes the three newest unsaved items from each feed.
+`./dist` builds `feedopus-VERSION.tar.gz` from the latest commit. The archive does not contain a config, a feed list, or episode memory.
 
-A channel is saved from oldest to newest. Channels take turns, in the order they appear in the feed list, so the first channel does not use every download in the run.
+To copy episode memory from another machine, pass that machine's `~/.local/state/feedopus`:
 
-Add a feed with one line in `~/.config/feedopus/feeds`:
+```
+./install-linux --state-from /path/to/old/state
+```
+
+## Use
+
+```
+feedopus init
+feedopus run --dry-run
+feedopus
+feedopus clean --dry-run
+```
+
+`feedopus init` writes `~/.config/feedopus/` and imports video feeds from newsboat. Finished audio goes to `~/Sync/podcast`.
+
+A feed line:
 
 ```
 https://www.youtube.com/feeds/videos.xml?channel_id=UCxxxx "Channel name"
 https://www.youtube.com/@Channel "Channel name"
 ```
 
-YouTube `feeds/videos.xml?channel_id=UCxxxx` lines are read as RSS. If that request fails, the channel's uploads playlist (`UUxxxx`) is checked instead. Other RSS and Atom URLs are read directly. Any other URL is a channel or playlist subscription.
+YouTube RSS is tried first. If that request fails, the channel's uploads playlist is checked. Other RSS and Atom feeds are read directly. Any other URL is a channel or playlist.
 
-`skip_was_live` controls stream archives. Set it to `false` to keep those recordings. A normal video that YouTube premiered is sometimes marked as a past livestream, and is then skipped while `skip_was_live` is true.
+The first visit to a feed takes items from the last two days and remembers the rest. Later runs take anything new. `feedopus run --backfill 3` takes the three newest unsaved items from each feed. Within a channel, files are saved oldest first, and channels take turns.
 
-Finished files are named from the title alone, with spaces and punctuation written as underscores, the way Grayjay names them. A period at the end of the title is dropped so the extension is the only dot. A file already in the output folder is skipped, including a Grayjay download whose name lost its emoji and punctuation or was cut short. Two different videos that share a long opening can be treated as the same file. A title that only adds a number, such as "Title 2", is still downloaded. The same upload on YouTube and Odysee is saved once. If the download archive lists a video and the audio file is gone, that video is downloaded again. A quiet archive hit is not reported as an error.
+Files are named from the title, with spaces and punctuation written as underscores, so a Grayjay download of the same video is recognized. A file already in the folder is skipped. Deleting a file does not forget the episode.
 
-## Android (Termux)
+`feedopus clean` deletes the oldest audio files and leaves the 30 newest. `--keep N` or `keep_episodes` in the config changes that number. `--dry-run` lists the files and deletes nothing.
 
-This is the Android build of the same program. It is not a Play Store app. Termux can run yt-dlp and ffmpeg, which is what actually fetches the audio.
+Run it on one device at a time. Two devices that have not synced a finished file will each download a copy.
+
+## Android
+
+Use Termux from F-Droid. This is not a Play Store app.
 
 ```
-pkg update
 pkg install python ffmpeg
 pip install -U yt-dlp
 termux-setup-storage
-```
-
-Copy `feedopus` onto the phone and install it on `PATH`:
-
-```
 install -m 755 feedopus "$PREFIX/bin/feedopus"
 ```
 
-Copy `~/.config/feedopus/` from the computer as well. `$PREFIX/bin` is Termux's normal bin directory.
-
-If Syncthing on the phone uses the same `~/Sync/podcast` path, leave `output_dir` as it is. Otherwise set it to something under shared storage, for example `~/storage/music/podcast`.
-
-Termux:Boot runs scripts in `~/.termux/boot/`. This one checks every two hours while Termux is running:
+Copy `~/.config/feedopus/` from the computer. If the phone's Syncthing folder is not `~/Sync/podcast`, set `output_dir` to that folder. Leave the two-hour loop below off while the Linux timer is enabled.
 
 ```sh
 #!/data/data/com.termux/files/usr/bin/sh
@@ -101,16 +73,12 @@ while true; do
 done
 ```
 
-Run it on one device at a time. Two devices checking the same feeds will each download a copy if they have not synced the finished file yet.
-
-`feedopus remove-timer` stops the Linux timer.
-
 ## Documentation
 
 ```
-feedopus --help          # commands and the options for a run
-man feedopus             # each setting, the files, and the first-visit rules
-tldr feedopus            # short examples
+feedopus --help
+man feedopus
+tldr feedopus
 ```
 
-`feedopus install-docs` copies the manual and the tldr page into your home directory. Those files live next to the `feedopus` program (`feedopus.1`, `tldr/pages/common/feedopus.md`). On fish, the same command installs a small `tldr` wrapper so `tldr -k` does not forget the page.
+`feedopus install-docs` installs the manual and the tldr page for the current user.
