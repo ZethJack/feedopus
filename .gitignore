@@ -1,5 +1,29 @@
-__pycache__/
-*.py[cod]
+# Per-machine config and feed list.
 /config
 /feeds
+
+# Episode memory, logs, and the run lock. These belong in the state directory.
+/state.json
+/archive.txt
+/feedopus.log
+/feedopus.log.1
+/feedopus.lock
+*.log
+
+# Netscape cookie jars.
+*cookies*.txt
+
+# Python bytecode and local virtualenvs.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Release archives from ./dist.
 *.tar.gz
+
+# Editor and backup files.
+*~
+*.swp
+*.swo
+.DS_Store
