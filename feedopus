@@ -1,0 +1,2290 @@
+#!/usr/bin/env python3
+"""Download new videos from selected feeds as Opus audio.
+
+Reads a feed list. YouTube channel feeds are checked from the uploads
+playlist. Other RSS and Atom feeds are read directly, and a channel or
+playlist URL is read with yt-dlp. Livestreams and archived livestreams
+(stream VODs) are not saved. Regular uploads are extracted with yt-dlp
+and ffmpeg to Opus.
+
+The same script runs on Linux and in Termux on Android. It needs python3,
+yt-dlp, and an ffmpeg build with libopus.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import email.utils
+import struct
+import fcntl
+import json
+import os
+import shlex
+import shutil
+import unicodedata
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import NamedTuple
+
+
+USER_AGENT = "feedopus/1.0"
+MAX_FEED_BYTES = 8_000_000
+PROBE_TIMEOUT = 90
+DEFAULTS = {
+    "output_dir": "~/Sync/podcast",
+    "filename": "%(title)s.%(ext)s",
+    "audio_format": "opus",
+    "audio_quality": "0",
+    "embed_thumbnail": "true",
+    "sponsorblock": "sponsor,selfpromo,interaction",
+    "since_days": "2",
+    "max_per_run": "8",
+    "skip_live": "true",
+    "skip_was_live": "true",
+    "live_give_up_days": "14",
+    "playlist_end": "15",
+    "sleep_seconds": "1",
+    "download_timeout_minutes": "45",
+    "cookies": "",
+    "extra_args": "",
+    "notify": "true",
+    "windows_filenames": "true",
+    "require_tag": "",
+    "feeds_file": "",
+}
+
+# Hosts imported from a newsboat urls file. Blogs and distro news stay out.
+IMPORT_MARKERS = (
+    "youtube.com",
+    "youtu.be",
+    "odysee.com",
+    "feeds/videos.xml",
+    "peertube",
+)
+
+
+@dataclass(frozen=True)
+class Feed:
+    url: str
+    name: str
+    tags: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Entry:
+    id: str
+    url: str
+    title: str
+    author: str
+    published: datetime | None
+    feed_url: str
+    feed_name: str
+
+
+class CmdResult(NamedTuple):
+    code: int
+    out: str
+    err: str
+
+
+@dataclass
+class Result:
+    status: str
+    detail: str
+    path: str = ""
+
+
+# --- paths and config -------------------------------------------------------
+
+
+def default_config_dir() -> Path:
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "feedopus"
+
+
+def default_state_dir() -> Path:
+    xdg = os.environ.get("XDG_STATE_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".local" / "state"
+    return base / "feedopus"
+
+
+def default_output_dir() -> Path:
+    sync = Path.home() / "Sync" / "podcast"
+    if sync.is_dir():
+        return sync
+    music = Path.home() / "storage" / "music"
+    if music.is_dir():
+        return music / "podcast"
+    shared = Path.home() / "storage" / "shared"
+    if shared.is_dir():
+        return shared / "podcast"
+    return sync
+
+
+def expand(value: str) -> str:
+    return os.path.expanduser(os.path.expandvars(value.strip()))
+
+
+def as_bool(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def as_int(value: str, key: str) -> int:
+    try:
+        return int(str(value).strip())
+    except ValueError:
+        raise SystemExit(f"config {key} must be an integer, got {value!r}")
+
+
+def load_config(path: Path) -> dict[str, str]:
+    cfg = dict(DEFAULTS)
+    if not path.exists():
+        return cfg
+    text = path.read_text(encoding="utf-8")
+    for lineno, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" not in stripped:
+            raise SystemExit(f"{path}:{lineno}: expected key = value")
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        cfg[key] = value
+    return cfg
+
+
+def config_text(feeds_file: Path) -> str:
+    return f"""# feedopus configuration. Paths with ~ are expanded.
+
+# Directory that receives finished audio files.
+output_dir = ~/Sync/podcast
+
+# yt-dlp output template, relative to output_dir.
+filename = %(title)s.%(ext)s
+
+audio_format = opus
+audio_quality = 0
+
+# Embed the video thumbnail as cover art, the way Grayjay does.
+embed_thumbnail = true
+
+# SponsorBlock categories to cut. Leave empty to keep the whole recording.
+sponsorblock = sponsor,selfpromo,interaction
+
+# The first time a feed is read, only items newer than this are downloaded.
+# Older items are remembered and left alone. Later runs download anything
+# that shows up and has not been seen before.
+since_days = 2
+
+# Maximum new downloads per run.
+max_per_run = 8
+
+# Skip videos that are live or scheduled to go live.
+skip_live = true
+
+# Skip the saved recording of a livestream (a stream VOD / premiere archive).
+skip_was_live = true
+
+# Stop rechecking a livestream after this many days.
+live_give_up_days = 14
+
+# How many recent videos to read from a channel or playlist URL.
+playlist_end = 15
+
+# Seconds to wait between yt-dlp calls.
+sleep_seconds = 1
+
+# Give up on one download after this many minutes.
+download_timeout_minutes = 45
+
+# Netscape cookies file for age-restricted videos. Leave empty to use none.
+cookies =
+
+# Extra arguments appended to every yt-dlp download, in shell syntax.
+extra_args =
+
+# Notify when a run saves files or hits errors (notify-send or Termux).
+notify = true
+
+# Avoid characters that phone storage and SD cards reject.
+windows_filenames = true
+
+# Feed list. One URL per line, newsboat style: url "Name" tag
+feeds_file = {feeds_file}
+
+# If set, only lines carrying this tag are used.
+require_tag =
+"""
+
+
+def feeds_path_from(cfg: dict[str, str], config_dir: Path) -> Path:
+    raw = cfg.get("feeds_file", "").strip()
+    if not raw:
+        return config_dir / "feeds"
+    return Path(expand(raw))
+
+
+# --- small text helpers -----------------------------------------------------
+
+
+def one_line(text: str, limit: int = 160) -> str:
+    cleaned = " ".join((text or "").split())
+    if len(cleaned) > limit:
+        return cleaned[: limit - 1] + "…"
+    return cleaned
+
+
+# Phone downloads (Grayjay and others) rewrite names: emoji and punctuation
+# disappear or become underscores, and long names are cut off. Matching uses
+# letters and digits only. A filename that shares a long opening with the
+# title is treated as the same recording.
+MIN_MATCH = 12
+MIN_TRUNCATED = 20
+AUDIO_EXTENSIONS = {".opus", ".ogg", ".m4a", ".mp3", ".aac", ".flac", ".mka", ".wav"}
+
+
+def strip_id_suffix(stem: str) -> str:
+    """Drop a trailing ' [videoId]' added by the output template."""
+    if not stem.endswith("]") or " [" not in stem:
+        return stem
+    head, _, tail = stem.rpartition(" [")
+    inner = tail[:-1]
+    if len(inner) >= 6 and all(ch.isalnum() or ch in "-_" for ch in inner):
+        return head
+    return stem
+
+
+def squash(text: str) -> str:
+    """Letters and digits only. Apostrophes are removed so I'm and I_m agree."""
+    folded = unicodedata.normalize("NFKD", text or "").casefold()
+    for mark in ("'", "’", "ʼ", "`", "´"):
+        folded = folded.replace(mark, "")
+    chars = []
+    for ch in folded:
+        if unicodedata.combining(ch):
+            continue
+        if ch.isalnum():
+            chars.append(ch)
+    return "".join(chars)
+
+
+def is_sequel_suffix(extra: str) -> bool:
+    """True for a trailing copy number, not for the rest of a shortened title."""
+    if extra.isdigit() and len(extra) <= 4:
+        return True
+    for prefix in ("part", "pt", "ep", "episode", "vol", "volume"):
+        if extra.startswith(prefix) and extra[len(prefix):].isdigit() and len(extra) - len(prefix) <= 3:
+            return True
+    return False
+
+
+# Characters Grayjay keeps in a download name. Everything else becomes '_'
+# or, for emoji, disappears. The result matches files already in the folder.
+GRAYJAY_KEEP = set("-_.+")
+
+
+def grayjay_stem(title: str) -> str:
+    """Filename stem Grayjay writes for a video title."""
+    text = unicodedata.normalize("NFC", title or "")
+    chars: list[str] = []
+    for char in text:
+        if char.isalnum() or char in GRAYJAY_KEEP:
+            chars.append(char)
+            continue
+        category = unicodedata.category(char)
+        if category.startswith("C") or category in {"So", "Sk", "Mn", "Mc", "Me"}:
+            continue
+        chars.append("_")
+    stem = "".join(chars)
+    while "__" in stem:
+        stem = stem.replace("__", "_")
+    stem = stem.strip("_").rstrip(".")
+    stem = stem.strip("_")
+    raw = stem.encode("utf-8")
+    if len(raw) > 240:
+        stem = raw[:240].decode("utf-8", "ignore").strip("_.")
+    return stem
+
+
+def place_like_grayjay(path: Path, title: str) -> Path:
+    """Rename a finished file to the title-only name Grayjay uses.
+
+    A file already at that name is left in place. The new copy is removed.
+    """
+    if not path.is_file() or title.startswith(("http://", "https://")):
+        return path
+    stem = grayjay_stem(title)
+    if not stem:
+        return path
+    target = path.with_name(stem + path.suffix)
+    if target == path:
+        return path
+    if target.exists():
+        path.unlink()
+        return target
+    path.rename(target)
+    return target
+
+
+def is_quality_suffix(extra: str) -> bool:
+    return extra in {
+        "1080", "1080p", "720", "720p", "480", "480p", "360", "360p",
+        "2160", "2160p", "4k", "hd", "sd", "opus", "mp3", "m4a", "audio",
+    }
+
+
+def file_matches(title_key: str, file_key: str) -> bool:
+    """True when a stored filename is this title, or a shortened form of it."""
+    if len(title_key) < MIN_MATCH or len(file_key) < MIN_MATCH:
+        return False
+    if title_key == file_key:
+        return True
+    # The file was cut off: it is a long opening of the full title.
+    if len(file_key) >= MIN_TRUNCATED and title_key.startswith(file_key):
+        return not is_sequel_suffix(title_key[len(file_key):])
+    # The file kept a short quality tag after the title.
+    if len(title_key) >= MIN_TRUNCATED and file_key.startswith(title_key):
+        extra = file_key[len(title_key):]
+        return is_quality_suffix(extra) and not is_sequel_suffix(extra)
+    return False
+
+
+class SeenTitles:
+    """Titles already saved, plus filenames already sitting in the output folder."""
+
+    def __init__(self) -> None:
+        self.exact: set[str] = set()
+        self.files: list[str] = []
+
+    def add_title(self, title: str) -> None:
+        key = squash(title)
+        if len(key) >= MIN_MATCH:
+            self.exact.add(key)
+
+    def add_stem(self, stem: str) -> None:
+        cleaned = strip_id_suffix(stem)
+        forms = [cleaned]
+        # "Channel - Title" keeps the title as its own name, so a short title
+        # still matches after the channel prefix is removed.
+        if " - " in cleaned:
+            forms.append(cleaned.split(" - ", 1)[-1])
+        for form in forms:
+            key = squash(form)
+            if len(key) >= MIN_MATCH and key not in self.files:
+                self.files.append(key)
+
+    def reason(self, title: str) -> str:
+        key = squash(title)
+        if len(key) < MIN_MATCH:
+            return ""
+        if any(file_matches(key, file_key) for file_key in self.files):
+            return "matching audio already in the output folder"
+        if key in self.exact:
+            return "same title already saved"
+        return ""
+
+
+def load_seen(state: dict, output_dir: Path) -> SeenTitles:
+    seen = SeenTitles()
+    for item in state.get("items", {}).values():
+        if item.get("status") != "downloaded":
+            continue
+        seen.add_title(str(item.get("title") or ""))
+        saved = str(item.get("path") or "")
+        if saved:
+            seen.add_stem(Path(saved).stem)
+    if output_dir.exists():
+        for path in output_dir.rglob("*"):
+            if not path.is_file() or path.name.startswith("."):
+                continue
+            if path.suffix.lower() in AUDIO_EXTENSIONS:
+                seen.add_stem(path.stem)
+    return seen
+
+
+def label(entry: Entry) -> str:
+    name = one_line(entry.feed_name, 40) or "feed"
+    title = one_line(entry.title, 100) or entry.url
+    return f"{name} — {title}"
+
+
+def pretty(path: str) -> str:
+    if not path:
+        return ""
+    try:
+        resolved = Path(path).expanduser()
+        home = Path.home()
+        if resolved.is_relative_to(home):
+            return "~/" + str(resolved.relative_to(home))
+    except (OSError, ValueError):
+        return path
+    return path
+
+
+def parse_date(value: str) -> datetime | None:
+    text = (value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        parsed = None
+    if parsed is None:
+        try:
+            parsed = email.utils.parsedate_to_datetime(text)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def local_name(tag: object) -> str:
+    if not isinstance(tag, str):
+        return ""
+    return tag.rsplit("}", 1)[-1]
+
+
+def children(node: ET.Element, name: str) -> list[ET.Element]:
+    return [child for child in list(node) if local_name(child.tag) == name]
+
+
+def child_text(node: ET.Element, name: str) -> str:
+    for child in children(node, name):
+        if child.text and child.text.strip():
+            return child.text.strip()
+    return ""
+
+
+def link_of(node: ET.Element) -> str:
+    alternate = ""
+    any_href = ""
+    text_url = ""
+    for link in children(node, "link"):
+        href = (link.get("href") or "").strip()
+        rel = link.get("rel")
+        if href and rel == "alternate" and not alternate:
+            alternate = href
+        if href and not any_href:
+            any_href = href
+        text = (link.text or "").strip()
+        if text.startswith("http") and not text_url:
+            text_url = text
+    return alternate or text_url or any_href
+
+
+def author_of(node: ET.Element, fallback: str) -> str:
+    for author in children(node, "author"):
+        name = child_text(author, "name")
+        if name:
+            return name
+    creator = child_text(node, "creator")
+    return creator or fallback
+
+
+def feed_author(node: ET.Element) -> str:
+    for author in children(node, "author"):
+        name = child_text(author, "name")
+        if name:
+            return name
+    return child_text(node, "title")
+
+
+def entry_date(node: ET.Element) -> datetime | None:
+    for key in ("published", "updated", "pubDate", "date"):
+        found = parse_date(child_text(node, key))
+        if found is not None:
+            return found
+    return None
+
+
+def youtube_id(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc.lower().removeprefix("www.").removeprefix("m.")
+    if host in {"youtube.com", "music.youtube.com"}:
+        query = urllib.parse.parse_qs(parsed.query)
+        video = query.get("v", [""])[0]
+        if video:
+            return f"yt:{video}"
+    if host == "youtu.be":
+        video = parsed.path.strip("/").split("/")[0]
+        if video:
+            return f"yt:{video}"
+    return ""
+
+
+# --- feed list and feed documents ------------------------------------------
+
+
+def parse_feed_line(line: str) -> Feed | None:
+    raw = line.strip()
+    if not raw or raw.startswith("#"):
+        return None
+    try:
+        parts = shlex.split(raw, posix=True)
+    except ValueError:
+        return None
+    if not parts or not parts[0].startswith(("http://", "https://")):
+        return None
+    name = parts[1] if len(parts) > 1 else ""
+    return Feed(parts[0], name, tuple(parts[2:]))
+
+
+def load_feeds(path: Path, require_tag: str) -> list[Feed]:
+    if not path.exists():
+        raise SystemExit(f"no feed list at {path}. Run: feedopus init")
+    seen: set[str] = set()
+    feeds: list[Feed] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        feed = parse_feed_line(line)
+        if feed is None or feed.url in seen:
+            continue
+        if require_tag and require_tag not in feed.tags:
+            continue
+        seen.add(feed.url)
+        feeds.append(feed)
+    return feeds
+
+
+def looks_like_feed(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    blob = (parsed.path + "?" + parsed.query).lower()
+    return any(bit in blob for bit in ("/feed", "rss", ".xml", "atom"))
+
+
+def import_newsboat(urls_path: Path) -> list[str]:
+    if not urls_path.exists():
+        return []
+    chosen = []
+    for line in urls_path.read_text(encoding="utf-8").splitlines():
+        feed = parse_feed_line(line)
+        if feed is None:
+            continue
+        haystack = feed.url.lower()
+        if any(marker in haystack for marker in IMPORT_MARKERS):
+            chosen.append(line.strip())
+    return chosen
+
+
+def fetch_bytes(url: str) -> bytes:
+    last: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(request, timeout=30) as response:
+                data = response.read(MAX_FEED_BYTES + 1)
+            if len(data) > MAX_FEED_BYTES:
+                raise RuntimeError("feed is larger than 8MB")
+            return data
+        except (urllib.error.URLError, TimeoutError, OSError, RuntimeError) as exc:
+            last = exc
+            if attempt == 1:
+                time.sleep(3)
+    assert last is not None
+    raise last
+
+
+def parse_feed_xml(data: bytes, feed: Feed) -> list[Entry]:
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    root = ET.fromstring(data)
+    tag = local_name(root.tag)
+    if tag == "feed":
+        channel = root
+        nodes = children(root, "entry")
+        fallback_author = feed_author(root)
+        channel_title = child_text(root, "title")
+    elif tag == "rss":
+        channels = children(root, "channel")
+        channel = channels[0] if channels else root
+        nodes = children(channel, "item")
+        fallback_author = feed_author(channel)
+        channel_title = child_text(channel, "title")
+    else:
+        raise ValueError(f"unknown feed type <{tag}>")
+    display = feed.name or channel_title or fallback_author or urllib.parse.urlparse(feed.url).netloc
+    entries: list[Entry] = []
+    seen: set[str] = set()
+    for node in nodes:
+        video = child_text(node, "videoId")
+        url = link_of(node)
+        if not url:
+            for enclosure in children(node, "enclosure"):
+                enclosed = (enclosure.get("url") or "").strip()
+                if enclosed:
+                    url = enclosed
+                    break
+        guid = child_text(node, "guid") or child_text(node, "id")
+        if video:
+            url = f"https://www.youtube.com/watch?v={video}"
+            entry_id = f"yt:{video}"
+        else:
+            entry_id = youtube_id(url) or guid or url
+        if not url or not entry_id or entry_id in seen:
+            continue
+        title = child_text(node, "title")
+        if not title:
+            for group in children(node, "group"):
+                title = child_text(group, "title")
+                if title:
+                    break
+        author = author_of(node, fallback_author or display)
+        entries.append(
+            Entry(
+                id=entry_id,
+                url=url,
+                title=title or url,
+                author=author,
+                published=entry_date(node),
+                feed_url=feed.url,
+                feed_name=display,
+            )
+        )
+        seen.add(entry_id)
+    return entries
+
+
+def youtube_listing_url(url: str) -> str | None:
+    """Playlist page for a YouTube Atom feed.
+
+    feeds/videos.xml often returns 404 or 500. The channel's uploads playlist
+    lists the same recent videos. A channel id UCxxxx uses playlist UUxxxx.
+    Other sites return None and keep their own RSS.
+    """
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc.lower().removeprefix("www.").removeprefix("m.")
+    if host not in {"youtube.com", "music.youtube.com"}:
+        return None
+    if "feeds/videos.xml" not in parsed.path:
+        return None
+    query = urllib.parse.parse_qs(parsed.query)
+    channel_id = (query.get("channel_id") or [""])[0].strip()
+    playlist_id = (query.get("playlist_id") or [""])[0].strip()
+    user = (query.get("user") or [""])[0].strip()
+    if channel_id.startswith("UC") and len(channel_id) > 2:
+        playlist_id = "UU" + channel_id[2:]
+    elif channel_id:
+        return f"https://www.youtube.com/channel/{urllib.parse.quote(channel_id)}/videos"
+    if playlist_id:
+        return "https://www.youtube.com/playlist?list=" + urllib.parse.quote(playlist_id)
+    if user:
+        return f"https://www.youtube.com/user/{urllib.parse.quote(user)}/videos"
+    return None
+
+
+def fetch_subscription(feed: Feed, playlist_end: int, cookies: str, page_url: str = "") -> list[Entry]:
+    target = page_url or feed.url
+    cmd = [
+        "yt-dlp",
+        "--flat-playlist",
+        "--playlist-end",
+        str(playlist_end),
+        "--no-warnings",
+        "--ignore-errors",
+        "--print",
+        "%(id)s\t%(webpage_url)s\t%(title)s\t%(channel)s\t%(timestamp)s",
+        target,
+    ]
+    host = urllib.parse.urlparse(target).netloc.lower()
+    if "youtube" in host or host.endswith("youtu.be"):
+        # Flat playlists omit dates unless this is set. The date is approximate.
+        cmd[1:1] = ["--extractor-args", "youtubetab:approximate_date"]
+    if cookies:
+        cmd[1:1] = ["--cookies", cookies]
+    result = run_cmd(cmd, PROBE_TIMEOUT)
+    if result.code != 0 and not result.out.strip():
+        detail = one_line(result.err or result.out) or f"yt-dlp exited {result.code}"
+        raise RuntimeError(detail)
+    display = feed.name or urllib.parse.urlparse(feed.url).netloc
+    entries: list[Entry] = []
+    seen: set[str] = set()
+    for raw in result.out.splitlines():
+        parts = raw.split("\t")
+        if len(parts) < 3:
+            continue
+        video, page, title, channel, stamp = (parts + ["", "", "", "", ""])[:5]
+        if not page or page == "NA":
+            if video and video != "NA":
+                page = f"https://www.youtube.com/watch?v={video}"
+            else:
+                continue
+        if video and video != "NA" and ("youtube" in feed.url or youtube_id(page)):
+            entry_id = f"yt:{video}"
+        elif video and video != "NA":
+            entry_id = video
+        else:
+            entry_id = page
+        if entry_id in seen:
+            continue
+        published = None
+        if stamp.isdigit():
+            published = datetime.fromtimestamp(int(stamp), timezone.utc)
+        name = feed.name or (channel if channel and channel != "NA" else display)
+        entries.append(
+            Entry(
+                id=entry_id,
+                url=page,
+                title=title if title and title != "NA" else page,
+                author=channel if channel and channel != "NA" else name,
+                published=published,
+                feed_url=feed.url,
+                feed_name=name,
+            )
+        )
+        seen.add(entry_id)
+    return entries
+
+
+def fetch_feed(feed: Feed, playlist_end: int, cookies: str) -> list[Entry]:
+    listing = youtube_listing_url(feed.url)
+    if listing:
+        return fetch_subscription(feed, playlist_end, cookies, listing)
+    if looks_like_feed(feed.url):
+        data = fetch_bytes(feed.url)
+        return parse_feed_xml(data, feed)
+    return fetch_subscription(feed, playlist_end, cookies)
+
+
+# --- planning ---------------------------------------------------------------
+
+
+def sort_entries(entries: list[Entry]) -> list[Entry]:
+    """Oldest first. Entries with no date stay in feed order, after the dated ones."""
+    dated = [entry for entry in entries if entry.published is not None]
+    undated = [entry for entry in entries if entry.published is None]
+    dated.sort(key=lambda entry: entry.published.timestamp())
+    return dated + undated
+
+
+def select_action(
+    prev: dict | None,
+    published: datetime | None,
+    feed_bootstrapped: bool,
+    window: int | None,
+    now: datetime,
+    retry: bool,
+) -> str:
+    """Return queue, seen, or ignore.
+
+    window is None when the feed was already read and the user did not pass
+    --since-days. In that case every unseen item is new.
+    """
+    if prev:
+        status = prev.get("status")
+        if status == "deferred":
+            return "queue"
+        if status == "error" and (retry or int(prev.get("tries") or 0) < 3):
+            return "queue"
+        return "ignore"
+    if window is None and feed_bootstrapped:
+        return "queue"
+    if published is None:
+        return "seen"
+    days = 2 if window is None else window
+    cutoff = now - timedelta(days=days)
+    if published >= cutoff:
+        return "queue"
+    return "seen"
+
+
+def plan_feed(
+    entries: list[Entry],
+    items: dict,
+    feed_bootstrapped: bool,
+    since_days: int,
+    since_days_explicit: bool,
+    backfill: int | None,
+    retry: bool,
+    now: datetime,
+) -> list[tuple]:
+    """Return ('queue', entry) or ('seen', entry, detail). Queued entries are oldest first."""
+    oldest_first = sort_entries(entries)
+    actions: list[tuple] = []
+    if backfill is not None:
+        # Pick the newest unsaved items, then save that selection from oldest to newest.
+        dated = [entry for entry in oldest_first if entry.published is not None]
+        undated = [entry for entry in oldest_first if entry.published is None]
+        taken = 0
+        queued: list[Entry] = []
+        for entry in list(reversed(dated)) + undated:
+            prev = items.get(entry.id)
+            if prev and prev.get("status") in {"downloaded", "skipped"}:
+                continue
+            if taken < backfill:
+                queued.append(entry)
+                taken += 1
+            elif prev is None:
+                actions.append(("seen", entry, f"outside backfill of {backfill}"))
+        actions.extend(("queue", entry) for entry in sort_entries(queued))
+        return actions
+
+    window: int | None
+    if since_days_explicit or not feed_bootstrapped:
+        window = since_days
+    else:
+        window = None
+
+    for entry in oldest_first:
+        choice = select_action(items.get(entry.id), entry.published, feed_bootstrapped, window, now, retry)
+        if choice == "queue":
+            actions.append(("queue", entry))
+        elif choice == "seen":
+            if entry.published is None:
+                detail = "undated on first fetch"
+            else:
+                detail = f"older than {window} days"
+            actions.append(("seen", entry, detail))
+    return actions
+
+
+def classify(live_status: str, was_live: str, is_live: str, skip_live: bool, skip_was_live: bool) -> str:
+    """Return download, skip, or defer."""
+    if not skip_live:
+        return "download"
+    status = (live_status or "").strip().lower()
+    was = (was_live or "").strip().lower() in {"true", "1", "yes"}
+    live = (is_live or "").strip().lower() in {"true", "1", "yes"}
+    if status == "was_live" or was:
+        return "skip" if skip_was_live else "download"
+    if live or status in {"is_live", "is_upcoming", "post_live"}:
+        return "defer"
+    return "download"
+
+
+def live_is_stale(entry: Entry, prev: dict | None, now: datetime, days: int) -> bool:
+    started = entry.published
+    if started is None and prev and prev.get("first_seen"):
+        started = parse_date(str(prev.get("first_seen")))
+    if started is None:
+        return False
+    return now - started > timedelta(days=days)
+
+
+def round_robin(groups: list[list[Entry]]) -> list[Entry]:
+    """Take turns across feeds. Each group is already oldest first, and that order is kept."""
+    queues = [deque(group) for group in groups if group]
+    ordered: list[Entry] = []
+    while queues:
+        remaining = []
+        for queue in queues:
+            ordered.append(queue.popleft())
+            if queue:
+                remaining.append(queue)
+        queues = remaining
+    return ordered
+
+
+# --- state ------------------------------------------------------------------
+
+
+def empty_state() -> dict:
+    return {"version": 1, "feeds": {}, "items": {}}
+
+
+def load_state(path: Path) -> dict:
+    if not path.exists():
+        return empty_state()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        broken = path.with_name(path.name + ".broken")
+        os.replace(path, broken)
+        log(f"state file was unreadable ({exc}); moved it to {pretty(str(broken))}")
+        return empty_state()
+    if not isinstance(data, dict):
+        return empty_state()
+    data.setdefault("version", 1)
+    data.setdefault("feeds", {})
+    data.setdefault("items", {})
+    return data
+
+
+def save_state(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def record(state: dict, entry: Entry, result: Result, prev: dict | None, now: datetime) -> None:
+    stamp = now.isoformat()
+    if result.status == "error":
+        if prev and prev.get("status") == "error":
+            tries = int(prev.get("tries") or 0) + 1
+        else:
+            tries = 1
+    else:
+        tries = 0
+    first_seen = stamp
+    if prev and prev.get("first_seen"):
+        first_seen = str(prev["first_seen"])
+    state["items"][entry.id] = {
+        "id": entry.id,
+        "url": entry.url,
+        "title": entry.title,
+        "author": entry.author,
+        "feed": entry.feed_name,
+        "published": entry.published.isoformat() if entry.published else "",
+        "status": result.status,
+        "detail": result.detail,
+        "path": result.path,
+        "updated": stamp,
+        "tries": tries,
+        "first_seen": first_seen,
+    }
+
+
+# --- yt-dlp -----------------------------------------------------------------
+
+
+def run_cmd(cmd: list[str], timeout: int) -> CmdResult:
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        stop_process_group(proc)
+        out, err = proc.communicate()
+        err = (err or "") + "\ntimed out"
+        return CmdResult(124, out or "", err)
+    return CmdResult(proc.returncode or 0, out or "", err or "")
+
+
+def stop_process_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait(timeout=10)
+
+
+def require_tools() -> None:
+    missing = [name for name in ("yt-dlp", "ffmpeg") if shutil.which(name) is None]
+    if missing:
+        raise SystemExit(
+            "missing required program: "
+            + ", ".join(missing)
+            + ". On Termux: pkg install python ffmpeg && pip install -U yt-dlp"
+        )
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-encoders"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if "libopus" not in (proc.stdout or ""):
+        raise SystemExit("ffmpeg has no libopus encoder, so Opus files cannot be written")
+
+
+def probe_live(url: str, cookies: str) -> tuple[str, str, str] | Result:
+    cmd = [
+        "yt-dlp",
+        "--skip-download",
+        "--no-warnings",
+        "--no-playlist",
+        "--print",
+        "%(live_status)s\t%(was_live)s\t%(is_live)s",
+    ]
+    if cookies:
+        cmd += ["--cookies", cookies]
+    cmd.append(url)
+    result = run_cmd(cmd, PROBE_TIMEOUT)
+    line = ""
+    for raw in result.out.splitlines():
+        if raw.strip():
+            line = raw.strip()
+            break
+    if result.code != 0 or not line:
+        detail = one_line(result.err or result.out) or f"yt-dlp exited {result.code}"
+        return Result("error", detail)
+    parts = line.split("\t")
+    while len(parts) < 3:
+        parts.append("")
+    return parts[0], parts[1], parts[2]
+
+
+def opus_files(root: Path) -> set[Path]:
+    if not root.exists():
+        return set()
+    return {path for path in root.rglob("*.opus") if path.is_file()}
+
+
+def clean_temp(temp: Path, max_age_days: int = 7) -> None:
+    """Drop abandoned partial downloads. Fresh ones stay so yt-dlp can resume."""
+    if not temp.exists():
+        return
+    cutoff = time.time() - max_age_days * 86400
+    for path in temp.iterdir():
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            continue
+
+
+def image_files(directory: Path) -> set[Path]:
+    if not directory.exists():
+        return set()
+    return {
+        path
+        for path in directory.iterdir()
+        if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
+    }
+
+
+def jpeg_size(data: bytes) -> tuple[int, int]:
+    """Width and height from a JPEG SOF marker. (0, 0) if it cannot be read."""
+    index = 2
+    while index + 9 < len(data):
+        if data[index] != 0xFF:
+            index += 1
+            continue
+        marker = data[index + 1]
+        if marker in (0xC0, 0xC1, 0xC2):
+            height = int.from_bytes(data[index + 5 : index + 7], "big")
+            width = int.from_bytes(data[index + 7 : index + 9], "big")
+            return width, height
+        if marker in (0xD8, 0xD9):
+            index += 2
+            continue
+        if index + 4 > len(data):
+            break
+        length = int.from_bytes(data[index + 2 : index + 4], "big")
+        if length < 2:
+            break
+        index += 2 + length
+    return 0, 0
+
+
+def picture_block(jpeg: bytes) -> str:
+    """Base64 FLAC picture block. Opus stores cover art in this comment."""
+    width, height = jpeg_size(jpeg)
+    mime = b"image/jpeg"
+    description = b"Cover (front)"
+    block = b"".join(
+        [
+            struct.pack(">I", 3),
+            struct.pack(">I", len(mime)),
+            mime,
+            struct.pack(">I", len(description)),
+            description,
+            struct.pack(">I", width),
+            struct.pack(">I", height),
+            struct.pack(">I", 24),
+            struct.pack(">I", 0),
+            struct.pack(">I", len(jpeg)),
+            jpeg,
+        ]
+    )
+    return base64.b64encode(block).decode("ascii")
+
+
+def ffmeta_escape(value: str) -> str:
+    """Escape a value for an ffmetadata file. Base64 padding contains '='."""
+    escaped = []
+    for char in value:
+        if char == "\n":
+            escaped.append("\\n")
+        elif char == "\r":
+            escaped.append("\\r")
+        elif char in "\\=;#":
+            escaped.append("\\" + char)
+        else:
+            escaped.append(char)
+    return "".join(escaped)
+
+
+def embed_cover(audio: Path, image: Path) -> bool:
+    """Attach a JPEG cover without re-encoding the audio.
+
+    The Opus muxer cannot take a video stream. The cover goes in the
+    METADATA_BLOCK_PICTURE comment, which is what players show for Grayjay files.
+    The picture is written to a metadata file. One ffmpeg argument cannot
+    exceed 128KiB, and a 1280x720 JPEG does.
+    """
+    jpeg_path = image
+    converted = audio.with_name(audio.stem + ".cover.jpg")
+    meta = audio.with_name(audio.stem + ".cover.ffmeta")
+    temporary = audio.with_name(audio.stem + ".cover" + audio.suffix)
+    try:
+        if image.suffix.lower() not in {".jpg", ".jpeg"}:
+            result = run_cmd(
+                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(image), str(converted)],
+                60,
+            )
+            if result.code != 0 or not converted.is_file():
+                log("cover art was not embedded (thumbnail was not a jpeg)")
+                return False
+            jpeg_path = converted
+        encoded = picture_block(jpeg_path.read_bytes())
+        meta.write_text(
+            ";FFMETADATA1\nMETADATA_BLOCK_PICTURE=" + ffmeta_escape(encoded) + "\n",
+            encoding="utf-8",
+        )
+        # Keep the tags yt-dlp wrote, and add the picture from the metadata file.
+        result = run_cmd(
+            [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(audio),
+                "-i",
+                str(meta),
+                "-map",
+                "0",
+                "-c",
+                "copy",
+                "-map_metadata",
+                "0",
+                "-map_metadata",
+                "1",
+                str(temporary),
+            ],
+            180,
+        )
+    except OSError as exc:
+        log(f"cover art was not embedded ({exc})")
+        return False
+    finally:
+        if jpeg_path is converted:
+            converted.unlink(missing_ok=True)
+        meta.unlink(missing_ok=True)
+    if result.code != 0 or not temporary.is_file() or temporary.stat().st_size == 0:
+        temporary.unlink(missing_ok=True)
+        detail = one_line(result.err or result.out)
+        log("cover art was not embedded" + (f" ({detail})" if detail else ""))
+        return False
+    os.replace(temporary, audio)
+    return True
+
+
+def archive_video_id(url: str) -> str:
+    """YouTube id as yt-dlp writes it in the download archive."""
+    marked = youtube_id(url)
+    if marked.startswith("yt:"):
+        return marked[3:]
+    return ""
+
+
+def archive_has_id(text: str, video_id: str) -> bool:
+    if not video_id:
+        return False
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[-1] == video_id:
+            return True
+    return False
+
+
+def archive_without_id(text: str, video_id: str) -> str:
+    """Archive text with one video id removed. Every other line stays."""
+    if not video_id:
+        return text
+    kept = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[-1] == video_id:
+            continue
+        kept.append(line)
+    if not kept:
+        return ""
+    body = "\n".join(kept)
+    if text.endswith("\n"):
+        body += "\n"
+    return body
+
+
+def read_archive(path: Path) -> str:
+    if not path.is_file():
+        return ""
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def forget_archived(path: Path, video_id: str) -> bool:
+    """Drop one id from the yt-dlp archive. The rest of the file is kept."""
+    text = read_archive(path)
+    updated = archive_without_id(text, video_id)
+    if updated == text:
+        return False
+    temporary = path.with_suffix(".txt.tmp")
+    temporary.write_text(updated, encoding="utf-8")
+    os.replace(temporary, path)
+    return True
+
+
+def missing_file_outcome(code: int, text: str, was_archived: bool, on_disk: bool) -> str:
+    """What to do when yt-dlp wrote no new audio file.
+
+    already: the video is already saved.
+    refetch: the archive lists it, and the output folder does not have it.
+    error: yt-dlp failed, or it finished without a file and without an archive hit.
+    """
+    said_archive = "already been recorded in the archive" in text
+    said_exists = "has already been downloaded" in text
+    if on_disk or said_exists:
+        return "already"
+    if code == 0 and (was_archived or said_archive):
+        return "refetch"
+    return "error"
+
+
+def stem_has_video_id(stem: str, video_id: str) -> bool:
+    """True when the id stands alone in the filename, as in 'Title [id]'."""
+    if not video_id:
+        return False
+    folded = stem.casefold()
+    needle = video_id.casefold()
+    start = 0
+    while True:
+        index = folded.find(needle, start)
+        if index < 0:
+            return False
+        end = index + len(needle)
+        before = folded[index - 1] if index else ""
+        after = folded[end] if end < len(folded) else ""
+        if not before.isalnum() and not after.isalnum():
+            return True
+        start = index + 1
+
+
+def audio_named_for(output_dir: Path, video_id: str, title: str) -> Path | None:
+    """An existing audio file for this video, by id in the name or the Grayjay stem."""
+    if not output_dir.is_dir():
+        return None
+    stem = ""
+    if title and not title.startswith(("http://", "https://")):
+        stem = grayjay_stem(title)
+    for path in output_dir.rglob("*"):
+        if not path.is_file() or path.name.startswith("."):
+            continue
+        if path.suffix.lower() not in AUDIO_EXTENSIONS:
+            continue
+        if stem and path.stem == stem:
+            return path
+        if stem_has_video_id(path.stem, video_id):
+            return path
+    return None
+
+
+def download(
+    url: str,
+    cfg: dict[str, str],
+    output_dir: Path,
+    state_dir: Path,
+    cookies: str,
+    title: str = "",
+) -> Result:
+    # Parts land outside output_dir so Syncthing does not pick up half a file.
+    temp_dir = state_dir / "tmp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    filename = cfg["filename"]
+    if "%(ext)s" not in filename:
+        filename = filename + ".%(ext)s"
+    want_cover = as_bool(cfg.get("embed_thumbnail", "true"))
+    cmd = [
+        "yt-dlp",
+        "--no-simulate",
+        "--no-playlist",
+        "--no-progress",
+        "-x",
+        "-f",
+        "bestaudio/best",
+        "--audio-format",
+        cfg["audio_format"],
+        "--audio-quality",
+        str(cfg["audio_quality"]),
+        "--embed-metadata",
+        "-o",
+        filename,
+        "-P",
+        f"home:{output_dir}",
+        "-P",
+        f"temp:{temp_dir}",
+        "-P",
+        f"thumbnail:{temp_dir}",
+        "--no-overwrites",
+        "--download-archive",
+        str(state_dir / "archive.txt"),
+        "--print",
+        "after_move:%(filepath)s",
+    ]
+    if want_cover:
+        # Write the thumbnail beside the temp files. Cover art is attached
+        # afterwards with ffmpeg, which does not need the mutagen module.
+        cmd += ["--write-thumbnail", "--convert-thumbnails", "jpg"]
+    if as_bool(cfg["windows_filenames"]):
+        cmd.append("--windows-filenames")
+    sponsorblock = cfg.get("sponsorblock", "").strip()
+    if sponsorblock:
+        cmd += ["--sponsorblock-remove", sponsorblock]
+    if cookies:
+        cmd += ["--cookies", cookies]
+    extra = cfg.get("extra_args", "").strip()
+    if extra:
+        cmd += shlex.split(extra)
+    cmd.append(url)
+    timeout = as_int(cfg["download_timeout_minutes"], "download_timeout_minutes") * 60
+    archive_path = state_dir / "archive.txt"
+    video_id = archive_video_id(url)
+    # --print implies quiet, so an archive hit exits 0 and prints nothing.
+    # A second pass runs only when that hit has no audio file left on disk.
+    for attempt in (1, 2):
+        was_archived = archive_has_id(read_archive(archive_path), video_id)
+        before = opus_files(output_dir)
+        images_before = image_files(temp_dir) if want_cover else set()
+        result = run_cmd(cmd, timeout)
+        text = result.out + "\n" + result.err
+        printed = [line.strip() for line in result.out.splitlines() if line.strip()]
+        wanted = "." + cfg["audio_format"].lower().lstrip(".")
+        audio = [line for line in printed if Path(line).suffix.lower() == wanted and Path(line).is_file()]
+        saved = audio[-1] if audio else ""
+        if not saved:
+            fresh = sorted(opus_files(output_dir) - before, key=lambda path: path.stat().st_mtime)
+            if fresh:
+                saved = str(fresh[-1])
+        if saved:
+            if want_cover:
+                attach_cover(Path(saved), temp_dir, images_before)
+            return Result("downloaded", "saved", saved)
+        existing = audio_named_for(output_dir, video_id, title)
+        outcome = missing_file_outcome(result.code, text, was_archived, existing is not None)
+        if outcome == "already":
+            return Result("downloaded", "already saved", str(existing) if existing else "")
+        if outcome == "refetch" and attempt == 1:
+            if not video_id:
+                return Result("error", "the archive lists this video, but the audio file is missing")
+            forget_archived(archive_path, video_id)
+            log("archive listed this video, but the audio file is missing; downloading it again")
+            continue
+        detail = one_line(result.err or result.out)
+        if not detail:
+            if result.code == 0:
+                detail = "yt-dlp finished without a file"
+            else:
+                detail = f"yt-dlp exited {result.code}"
+        return Result("error", detail)
+    return Result("error", "yt-dlp finished without a file")
+
+
+def attach_cover(audio: Path, temp_dir: Path, images_before: set[Path]) -> None:
+    fresh = sorted(image_files(temp_dir) - images_before, key=lambda path: path.stat().st_mtime)
+    jpegs = [path for path in fresh if path.suffix.lower() in {".jpg", ".jpeg"}]
+    chosen = (jpegs or fresh)[-1] if (jpegs or fresh) else None
+    try:
+        if chosen is None:
+            log("cover art was not embedded (no thumbnail)")
+        else:
+            embed_cover(audio, chosen)
+    except Exception as exc:
+        log(f"cover art was not embedded ({one_line(str(exc))})")
+    for picture in fresh:
+        picture.unlink(missing_ok=True)
+
+
+def process_entry(
+    entry: Entry,
+    state: dict,
+    cfg: dict[str, str],
+    output_dir: Path,
+    state_dir: Path,
+    cookies: str,
+    seen: SeenTitles,
+    now: datetime,
+    dry_run: bool,
+) -> Result:
+    prev = state["items"].get(entry.id)
+    duplicate = seen.reason(entry.title)
+    if duplicate:
+        return Result("skipped", duplicate)
+    probed = probe_live(entry.url, cookies)
+    if isinstance(probed, Result):
+        return probed
+    live_status, was_live, is_live = probed
+    decision = classify(
+        live_status,
+        was_live,
+        is_live,
+        as_bool(cfg["skip_live"]),
+        as_bool(cfg["skip_was_live"]),
+    )
+    if decision == "skip":
+        return Result("skipped", f"livestream VOD ({live_status or 'was_live'})")
+    if decision == "defer":
+        give_up = as_int(cfg["live_give_up_days"], "live_give_up_days")
+        if live_is_stale(entry, prev, now, give_up):
+            return Result("skipped", f"livestream left alone after {give_up} days")
+        return Result("deferred", live_status or "live")
+    if dry_run:
+        seen.add_title(entry.title)
+        return Result("downloaded", "dry-run")
+    saved = download(entry.url, cfg, output_dir, state_dir, cookies, entry.title)
+    if saved.status == "downloaded":
+        seen.add_title(entry.title)
+        if saved.detail == "saved" and saved.path:
+            final = place_like_grayjay(Path(saved.path), entry.title)
+            saved = Result(saved.status, saved.detail, str(final))
+            seen.add_stem(final.stem)
+        elif saved.path:
+            # Already on disk. Remember the name, and do not rename that file.
+            seen.add_stem(Path(saved.path).stem)
+            saved = Result(saved.status, saved.detail, "")
+    return saved
+
+
+# --- logging and notifications ----------------------------------------------
+
+
+LOG_PATH: Path | None = None
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+    if LOG_PATH is None:
+        return
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size > 1_000_000:
+            os.replace(LOG_PATH, LOG_PATH.with_name("feedopus.log.1"))
+        stamp = datetime.now().isoformat(timespec="seconds")
+        with LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(f"{stamp} {message}\n")
+    except OSError:
+        return
+
+
+def notify(title: str, body: str, enabled: bool) -> None:
+    if not enabled:
+        return
+    if shutil.which("notify-send"):
+        subprocess.run(
+            ["notify-send", "-a", "feedopus", title, body],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        return
+    if shutil.which("termux-notification"):
+        subprocess.run(
+            ["termux-notification", "--title", title, "--content", body, "--id", "feedopus"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+
+
+def wake(lock: bool) -> None:
+    command = "termux-wake-lock" if lock else "termux-wake-unlock"
+    if shutil.which(command):
+        subprocess.run([command], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def pause(seconds: int) -> None:
+    if seconds > 0:
+        time.sleep(seconds)
+
+
+# --- commands ---------------------------------------------------------------
+
+
+def resolve_dirs(args: argparse.Namespace) -> tuple[Path, Path]:
+    config_dir = Path(args.config_dir).expanduser() if args.config_dir else default_config_dir()
+    state_dir = Path(args.state_dir).expanduser() if args.state_dir else default_state_dir()
+    return config_dir, state_dir
+
+
+def cmd_init(config_dir: Path, force: bool = False) -> int:
+    config_dir.mkdir(parents=True, exist_ok=True)
+    feeds_file = config_dir / "feeds"
+    config_file = config_dir / "config"
+    if config_file.exists() and not force:
+        log(f"config already exists: {pretty(str(config_file))}")
+    else:
+        config_file.write_text(config_text(feeds_file), encoding="utf-8")
+        log(f"wrote {pretty(str(config_file))}")
+    if feeds_file.exists() and not force:
+        log(f"feed list already exists: {pretty(str(feeds_file))}")
+        return 0
+    newsboat = Path.home() / ".config" / "newsboat" / "urls"
+    imported = import_newsboat(newsboat)
+    header = [
+        "# Feeds and subscriptions to save as audio.",
+        "# One URL per line. Optional quoted name, then optional tags:",
+        '#   https://www.youtube.com/feeds/videos.xml?channel_id=UC... "Name"',
+        "#   https://www.youtube.com/@Channel \"Name\"",
+        "# YouTube feeds/videos.xml lines are checked from the uploads playlist.",
+        "# Other RSS/Atom URLs are read directly. Any other URL is a channel or playlist.",
+        "# Imported video feeds from newsboat. Blogs and distro news were left out.",
+        "",
+    ]
+    body = imported or [
+        "# https://www.youtube.com/feeds/videos.xml?channel_id=CHANNEL_ID \"Channel name\""
+    ]
+    feeds_file.write_text("\n".join(header + body) + "\n", encoding="utf-8")
+    log(f"wrote {pretty(str(feeds_file))} ({len(imported)} feeds)")
+    if not imported:
+        log("no video feeds were found in newsboat. Add URLs to the feed list.")
+        return 1
+    return 0
+
+
+def checked_output(cfg: dict[str, str], override: str | None) -> Path:
+    raw = override or cfg.get("output_dir") or ""
+    if not raw or raw.strip() == "auto":
+        path = default_output_dir()
+    else:
+        path = Path(expand(raw))
+    resolved = path.expanduser().resolve()
+    if resolved == Path.home().resolve() or resolved == Path("/"):
+        raise SystemExit(f"refusing to use {resolved} as output_dir")
+    return resolved
+
+
+def checked_cookies(cfg: dict[str, str]) -> str:
+    raw = cfg.get("cookies", "").strip()
+    if not raw:
+        return ""
+    path = Path(expand(raw))
+    if not path.is_file():
+        log(f"cookies file not found, ignoring: {path}")
+        return ""
+    return str(path)
+
+
+def acquire_lock(state_dir: Path):
+    state_dir.mkdir(parents=True, exist_ok=True)
+    handle = (state_dir / "feedopus.lock").open("a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        log("feedopus is already running")
+        return None
+    return handle
+
+
+def cmd_list(config_dir: Path) -> int:
+    cfg = load_config(config_dir / "config")
+    feeds = load_feeds(feeds_path_from(cfg, config_dir), cfg.get("require_tag", "").strip())
+    if not feeds:
+        log("feed list is empty")
+        return 1
+    for feed in feeds:
+        name = feed.name or "(no name)"
+        tags = " ".join(feed.tags)
+        suffix = f" [{tags}]" if tags else ""
+        print(f"{name}{suffix}\n  {feed.url}")
+    return 0
+
+
+def cmd_status(state_dir: Path) -> int:
+    state = load_state(state_dir / "state.json")
+    counts: dict[str, int] = {}
+    for item in state["items"].values():
+        status = str(item.get("status") or "unknown")
+        counts[status] = counts.get(status, 0) + 1
+    feeds = state.get("feeds", {})
+    ready = sum(1 for feed in feeds.values() if feed.get("bootstrapped"))
+    print(f"feeds remembered: {len(feeds)} ({ready} already caught up)")
+    if not counts:
+        print("no items remembered yet")
+        return 0
+    for status in ("downloaded", "skipped", "seen", "deferred", "error"):
+        if counts.get(status):
+            print(f"{status}: {counts[status]}")
+    errors = [item for item in state["items"].values() if item.get("status") == "error"]
+    for item in errors[-10:]:
+        print(f"  error  {one_line(str(item.get('title') or item.get('url')))} ({one_line(str(item.get('detail') or ''))})")
+    return 0
+
+
+def cmd_grab(args: argparse.Namespace, config_dir: Path, state_dir: Path) -> int:
+    global LOG_PATH
+    require_tools()
+    cfg = load_config(config_dir / "config")
+    if not (config_dir / "config").exists():
+        log("no config yet. Run: feedopus init")
+    output_dir = checked_output(cfg, args.output_dir)
+    LOG_PATH = state_dir / "feedopus.log"
+    cookies = checked_cookies(cfg)
+    lock = acquire_lock(state_dir)
+    if lock is None:
+        return 0
+    try:
+        state = load_state(state_dir / "state.json")
+        entry_id = youtube_id(args.url) or args.url
+        entry = Entry(
+            id=entry_id,
+            url=args.url,
+            title=args.url,
+            author="",
+            published=datetime.now(timezone.utc),
+            feed_url="",
+            feed_name="grab",
+        )
+        now = datetime.now(timezone.utc)
+        seen = load_seen(state, output_dir)
+        wake(True)
+        result = process_entry(entry, state, cfg, output_dir, state_dir, cookies, seen, now, args.dry_run)
+        if result.status == "downloaded" and not args.dry_run:
+            # The feed title was the URL. Keep yt-dlp's filename, and store the URL title
+            # only when we learned nothing better. Probe does not return the title.
+            record(state, entry, result, state["items"].get(entry.id), now)
+            save_state(state_dir / "state.json", state)
+            where = pretty(result.path) or output_dir
+            log(f"saved     {where}")
+        elif args.dry_run and result.status == "downloaded":
+            log(f"would save {args.url}")
+        else:
+            if not args.dry_run:
+                record(state, entry, result, state["items"].get(entry.id), now)
+                save_state(state_dir / "state.json", state)
+            log(f"{result.status:<10} {args.url} ({result.detail})")
+        return 0 if result.status != "error" else 1
+    finally:
+        wake(False)
+        lock.close()
+
+
+def cmd_run(args: argparse.Namespace, config_dir: Path, state_dir: Path) -> int:
+    global LOG_PATH
+    config_file = config_dir / "config"
+    if not config_file.exists():
+        log("creating a first-time config from newsboat")
+        cmd_init(config_dir)
+    cfg = load_config(config_file)
+    feeds_file = feeds_path_from(cfg, config_dir)
+    if not feeds_file.exists():
+        raise SystemExit(f"no feed list at {feeds_file}. Run: feedopus init")
+    require_tools()
+    output_dir = checked_output(cfg, args.output_dir)
+    LOG_PATH = state_dir / "feedopus.log"
+    cookies = checked_cookies(cfg)
+    feeds = load_feeds(feeds_file, cfg.get("require_tag", "").strip())
+    if not feeds:
+        raise SystemExit(f"no feeds selected in {feeds_file}")
+    lock = acquire_lock(state_dir)
+    if lock is None:
+        return 0
+    clean_temp(state_dir / "tmp")
+    wake(True)
+    try:
+        return run_locked(args, cfg, feeds, output_dir, state_dir, cookies)
+    finally:
+        wake(False)
+        lock.close()
+
+
+def run_locked(
+    args: argparse.Namespace,
+    cfg: dict[str, str],
+    feeds: list[Feed],
+    output_dir: Path,
+    state_dir: Path,
+    cookies: str,
+) -> int:
+    state_path = state_dir / "state.json"
+    state = load_state(state_path)
+    now = datetime.now(timezone.utc)
+    since_days = args.since_days if args.since_days is not None else as_int(cfg["since_days"], "since_days")
+    if since_days < 0:
+        raise SystemExit("--since-days must be 0 or more")
+    explicit = args.since_days is not None
+    backfill = args.backfill
+    if backfill is not None and backfill < 1:
+        raise SystemExit("--backfill must be 1 or more")
+    max_per_run = args.max_per_run if args.max_per_run is not None else as_int(cfg["max_per_run"], "max_per_run")
+    if max_per_run < 1:
+        raise SystemExit("--max must be 1 or more")
+    sleep_seconds = as_int(cfg["sleep_seconds"], "sleep_seconds")
+    playlist_end = as_int(cfg["playlist_end"], "playlist_end")
+    seen = load_seen(state, output_dir)
+    groups: list[list[Entry]] = []
+    feeds_ok = 0
+    feeds_failed = 0
+    undated_first = False
+
+    for feed in feeds:
+        info = state["feeds"].get(feed.url) or {}
+        bootstrapped = bool(info.get("bootstrapped"))
+        try:
+            entries = fetch_feed(feed, playlist_end, cookies)
+        except (urllib.error.URLError, TimeoutError, OSError, RuntimeError, ET.ParseError, ValueError) as exc:
+            feeds_failed += 1
+            log(f"error     {feed.name or feed.url} ({one_line(str(exc))})")
+            if not args.dry_run:
+                info = dict(info)
+                info["last_error"] = one_line(str(exc))
+                info["name"] = feed.name
+                state["feeds"][feed.url] = info
+                save_state(state_path, state)
+            continue
+        feeds_ok += 1
+        actions = plan_feed(
+            entries,
+            state["items"],
+            bootstrapped,
+            since_days,
+            explicit,
+            backfill,
+            args.retry,
+            now,
+        )
+        queued: list[Entry] = []
+        seen_count = 0
+        undated = 0
+        for action in actions:
+            if action[0] == "queue":
+                queued.append(action[1])
+            else:
+                seen_count += 1
+                if action[2] == "undated on first fetch":
+                    undated += 1
+                if not args.dry_run:
+                    record(state, action[1], Result("seen", action[2]), state["items"].get(action[1].id), now)
+        if not args.dry_run:
+            state["feeds"][feed.url] = {
+                "bootstrapped": True,
+                "name": feed.name or (entries[0].feed_name if entries else ""),
+                "last_ok": now.isoformat(),
+                "last_error": "",
+            }
+            save_state(state_path, state)
+        name = feed.name or (entries[0].feed_name if entries else feed.url)
+        if queued or not bootstrapped:
+            extra = ""
+            if undated and not bootstrapped:
+                undated_first = True
+                extra = ". No dates on the first fetch; use --backfill N for the newest"
+            log(f"{name}: {len(queued)} to check, {seen_count} left alone{extra}")
+        groups.append(queued)
+
+    if feeds_ok == 0:
+        log("every feed failed")
+        notify("feedopus", "Every feed failed. See the log.", as_bool(cfg["notify"]))
+        return 1
+
+    ordered = round_robin(groups)
+    saved: list[str] = []
+    skipped = 0
+    deferred = 0
+    errors = 0
+    attempts = 0
+    calls = 0
+    for entry in ordered:
+        if attempts >= max_per_run:
+            break
+        if calls:
+            pause(sleep_seconds)
+        calls += 1
+        result = process_entry(
+            entry,
+            state,
+            cfg,
+            output_dir,
+            state_dir,
+            cookies,
+            seen,
+            now,
+            args.dry_run,
+        )
+        if result.status in {"downloaded", "error"} and result.detail != "dry-run":
+            attempts += 1
+        if result.detail == "dry-run" and result.status == "downloaded":
+            attempts += 1
+            saved.append(label(entry))
+            log(f"would save {label(entry)}")
+            continue
+        if not args.dry_run:
+            record(state, entry, result, state["items"].get(entry.id), now)
+            save_state(state_path, state)
+        if result.status == "downloaded":
+            where = pretty(result.path)
+            suffix = f" -> {where}" if where else ""
+            log(f"saved     {label(entry)}{suffix}")
+            saved.append(label(entry) + (f"\n{where}" if where else ""))
+        elif result.status == "skipped":
+            skipped += 1
+            log(f"skip      {label(entry)} ({result.detail})")
+        elif result.status == "deferred":
+            deferred += 1
+            log(f"defer     {label(entry)} ({result.detail})")
+        else:
+            errors += 1
+            log(f"error     {label(entry)} ({result.detail})")
+
+    if not ordered:
+        log("nothing new")
+    else:
+        verb = "would save" if args.dry_run else "saved"
+        log(
+            f"{verb} {len(saved)}, skipped {skipped}, "
+            f"still live {deferred}, errors {errors}"
+        )
+    if undated_first and backfill is None:
+        log("some feeds had no dates. feedopus run --backfill 3 grabs the three newest from each")
+    if not args.dry_run and (saved or errors):
+        if saved:
+            body = f"Saved {len(saved)} audio file" + ("" if len(saved) == 1 else "s")
+            shown = "\n".join(item.split("\n", 1)[0] for item in saved[:5])
+            notify("feedopus", body + "\n" + shown, as_bool(cfg["notify"]))
+        elif errors:
+            notify("feedopus", f"{errors} download" + ("s" if errors != 1 else "") + " failed", as_bool(cfg["notify"]))
+    return 0
+
+
+TIMER_UNIT = """[Unit]
+Description=Check video feeds for new Opus audio
+
+[Timer]
+OnCalendar=*-*-* 00/2:20:00
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def service_unit(executable: str) -> str:
+    return f"""[Unit]
+Description=Download new videos from selected feeds as Opus audio
+
+[Service]
+Type=oneshot
+ExecStart={executable} run
+Nice=10
+TimeoutStartSec=4h
+"""
+
+
+def cmd_install_docs() -> int:
+    """Copy the manual and the tldr page into the per-user locations."""
+    root = Path(__file__).resolve().parent
+    man_src = root / "feedopus.1"
+    tldr_src = root / "tldr" / "pages" / "common" / "feedopus.md"
+    fish_src = root / "fish" / "tldr.fish"
+    missing = [str(path) for path in (man_src, tldr_src, fish_src) if not path.is_file()]
+    if missing:
+        raise SystemExit(
+            "documentation files missing next to feedopus: "
+            + ", ".join(missing)
+            + ". Run ./install-linux from the unpacked source tree."
+        )
+
+    man_dir = Path.home() / ".local" / "share" / "man" / "man1"
+    man_dir.mkdir(parents=True, exist_ok=True)
+    (man_dir / "feedopus.1").write_bytes(man_src.read_bytes())
+
+    data_home = os.environ.get("XDG_DATA_HOME", "").strip()
+    data_base = Path(data_home) if data_home else Path.home() / ".local" / "share"
+    cache_home = os.environ.get("XDG_CACHE_HOME", "").strip()
+    cache_base = Path(cache_home) if cache_home else Path.home() / ".cache"
+    page = tldr_src.read_bytes()
+    for base in (data_base, cache_base):
+        dest_dir = base / "tldr" / "pages" / "common"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        (dest_dir / "feedopus.md").write_bytes(page)
+
+    functions = Path.home() / ".config" / "fish" / "functions"
+    fish_dest = functions / "tldr.fish"
+    if functions.is_dir():
+        current = fish_dest.read_text(encoding="utf-8") if fish_dest.is_file() else ""
+        if fish_dest.is_file() and "feedopus-tldr-wrapper" not in current:
+            log(f"left the existing fish function in place: {fish_dest}")
+        else:
+            fish_dest.write_bytes(fish_src.read_bytes())
+    log("installed man feedopus and tldr feedopus")
+    return 0
+
+
+def cmd_install_timer() -> int:
+    if not shutil.which("systemctl"):
+        raise SystemExit("systemctl is not available. On Android, use the Termux loop in the README.")
+    executable = Path("~/.local/bin/feedopus").expanduser()
+    if not os.access(executable, os.X_OK):
+        executable = Path(__file__).resolve()
+    unit_dir = Path.home() / ".config" / "systemd" / "user"
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    (unit_dir / "feedopus.service").write_text(service_unit(str(executable)), encoding="utf-8")
+    (unit_dir / "feedopus.timer").write_text(TIMER_UNIT, encoding="utf-8")
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    enabled = subprocess.run(["systemctl", "--user", "enable", "feedopus.timer"], check=False)
+    if enabled.returncode != 0:
+        raise SystemExit("could not enable feedopus.timer")
+    # Do not start the timer here. Persistent=true can run one missed slot as
+    # soon as the timer starts, which would begin a download immediately.
+    log("enabled feedopus.timer. Start it with: systemctl --user start feedopus.timer")
+    log("It checks about every two hours, at :20 past even hours.")
+    return 0
+
+
+def cmd_remove_timer() -> int:
+    subprocess.run(["systemctl", "--user", "disable", "--now", "feedopus.timer"], check=False)
+    unit_dir = Path.home() / ".config" / "systemd" / "user"
+    for name in ("feedopus.timer", "feedopus.service"):
+        path = unit_dir / name
+        if path.exists():
+            path.unlink()
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    log("removed feedopus.timer")
+    return 0
+
+
+def cmd_self_test() -> int:
+    failed = 0
+
+    def check(name: str, cond: bool) -> None:
+        nonlocal failed
+        print(("ok  " if cond else "FAIL") + " " + name)
+        if not cond:
+            failed += 1
+
+    atom = b"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns="http://www.w3.org/2005/Atom">
+ <title>Example</title>
+ <author><name>Example Author</name></author>
+ <entry>
+  <id>yt:video:abcdefghijk</id>
+  <yt:videoId>abcdefghijk</yt:videoId>
+  <title>A normal video</title>
+  <link rel="alternate" href="https://www.youtube.com/watch?v=abcdefghijk"/>
+  <published>2026-10-20T00:00:00+00:00</published>
+ </entry>
+</feed>
+"""
+    rss = b"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/">
+ <channel>
+  <title>Odysee Example</title>
+  <item>
+   <title><![CDATA[Cross post title]]></title>
+   <link>https://odysee.com/cross-post:abc</link>
+   <guid>https://odysee.com/cross-post:abc</guid>
+   <pubDate>Tue, 20 Oct 2026 00:00:00 GMT</pubDate>
+   <dc:creator>Example Author</dc:creator>
+  </item>
+ </channel>
+</rss>
+"""
+    feed = Feed("https://example.com/feed.xml", "", ())
+    atom_entries = parse_feed_xml(atom, feed)
+    rss_entries = parse_feed_xml(rss, feed)
+    check("atom id", len(atom_entries) == 1 and atom_entries[0].id == "yt:abcdefghijk")
+    check("atom url", atom_entries[0].url.endswith("watch?v=abcdefghijk"))
+    check("atom author", atom_entries[0].author == "Example Author")
+    check("atom date", atom_entries[0].published == datetime(2026, 10, 20, tzinfo=timezone.utc))
+    check("rss guid", rss_entries[0].id == "https://odysee.com/cross-post:abc")
+    check("rss title", rss_entries[0].title == "Cross post title")
+    check("rss date", rss_entries[0].published == datetime(2026, 10, 20, tzinfo=timezone.utc))
+    parsed = parse_feed_line('https://example.com/a.xml "A name" audio extra')
+    check("feed line", parsed == Feed("https://example.com/a.xml", "A name", ("audio", "extra")))
+    check("comment", parse_feed_line("# nope") is None)
+    check("youtube id", youtube_id("https://youtu.be/abcdefghijk") == "yt:abcdefghijk")
+    check("strip id", strip_id_suffix("Name - Title [XKzWCls1DxI]") == "Name - Title")
+    check(
+        "squash",
+        squash("F-Droid 2.0 - The Biggest Update!") == squash("f-droid 2.0 the biggest update"),
+    )
+    check("apostrophe", squash("You Won't") == squash("You_Won_t"))
+    seen_files = SeenTitles()
+    seen_files.add_stem("Japanese_Tourist_learn_the_hard_way")
+    seen_files.add_stem("I_m_making_a_the_move.")
+    seen_files.add_stem("France_On_The_Edge_Of_Civil_War")
+    seen_files.add_stem("Problematic_Vtuber_Just_Ruined_Her_Career_And_You_Won_t_Believe_Why....")
+    seen_files.add_stem("Japanese_Tourist_learn_the_ha")
+    seen_files.add_stem("Liberal Hivemind - Well, well, well... Look what we FOUND here. [8jJPRq4LK4s]")
+    seen_files.add_stem('Star_Wars_On_The_SKIDS_｜_ANOTHER_Project_Confirmed_As_＂ICED＂')
+    check("emoji file", seen_files.reason("Japanese Tourist learn the hard way 😂").startswith("matching"))
+    check("apostrophe file", seen_files.reason("I'm making a the move.").startswith("matching"))
+    check("emoji title", seen_files.reason("🚨 France On The Edge Of Civil War 🚨").startswith("matching"))
+    check("quotes", seen_files.reason('"Problematic" Vtuber Just "Ruined Her Career" And You Won\'t Believe Why...').startswith("matching"))
+    check("truncated", seen_files.reason("Japanese Tourist learn the hard way at night").startswith("matching"))
+    check("uploader prefix", seen_files.reason("Well, well, well... Look what we FOUND here.").startswith("matching"))
+    check("fullwidth", seen_files.reason('Star Wars On The SKIDS | ANOTHER Project Confirmed As "ICED"').startswith("matching"))
+    check("short title", seen_files.reason("Update") == "")
+    sequel = SeenTitles()
+    sequel.add_stem("Those_Who_Built_Open_Source")
+    check("sequel", sequel.reason("Those Who Built Open Source 2") == "")
+    check("different", sequel.reason("Fortnite On Linux Changes Everything For Linux Gaming") == "")
+    series = SeenTitles()
+    series.add_stem("Alien_General_Arm_Wrestled_a_Human_Cadet_Best_HFY_Stories")
+    check("series tail", series.reason("Best HFY Stories From The Vault Tonight Extra") == "")
+    check("skip vod", classify("was_live", "True", "False", True, True) == "skip")
+    check("keep vod", classify("was_live", "True", "False", True, False) == "download")
+    check("defer live", classify("is_live", "False", "True", True, True) == "defer")
+    check("defer soon", classify("is_upcoming", "False", "False", True, True) == "defer")
+    check("download upload", classify("not_live", "False", "False", True, True) == "download")
+    check("ignore filter", classify("is_live", "False", "True", False, True) == "download")
+
+    now = datetime(2026, 10, 21, tzinfo=timezone.utc)
+    recent = Entry("a", "https://example.com/a", "Recent title here", "", now - timedelta(days=1), "", "Ex")
+    old = Entry("b", "https://example.com/b", "Old title here", "", now - timedelta(days=10), "", "Ex")
+    undated = Entry("c", "https://example.com/c", "Undated title here", "", None, "", "Ex")
+    items: dict = {}
+    first = plan_feed([old, recent, undated], items, False, 2, False, None, False, now)
+    kinds = {item[1].id: item[0] for item in first}
+    check("first recent", kinds.get("a") == "queue")
+    check("first old", kinds.get("b") == "seen")
+    check("first undated", kinds.get("c") == "seen")
+    later = plan_feed([old], {}, True, 2, False, None, False, now)
+    check("later new", later and later[0][0] == "queue")
+    remembered = {"b": {"status": "downloaded"}}
+    again = plan_feed([old, recent], remembered, True, 2, False, None, False, now)
+    again_ids = {item[1].id for item in again}
+    check("skip downloaded", "b" not in again_ids and any(item[1].id == "a" for item in again))
+    filled = plan_feed([recent, old, undated], {}, False, 2, False, 1, False, now)
+    check("backfill one", [item[1].id for item in filled if item[0] == "queue"] == ["a"])
+    check("backfill rest", sum(1 for item in filled if item[0] == "seen") == 2)
+    mid = Entry("m", "https://example.com/m", "Mid title here", "", now - timedelta(days=3), "", "Ex")
+    newest = Entry("n", "https://example.com/n", "New title here", "", now - timedelta(days=1), "", "Ex")
+    span = plan_feed([newest, old, mid], {}, False, 14, True, None, False, now)
+    check("oldest first", [item[1].id for item in span if item[0] == "queue"] == ["b", "m", "n"])
+    picked = plan_feed([newest, old, mid, undated], {}, False, 2, False, 2, False, now)
+    check("backfill newest", [item[1].id for item in picked if item[0] == "queue"] == ["m", "n"])
+    turns = round_robin([[old, recent], [mid, newest]])
+    check("take turns", [item.id for item in turns] == ["b", "m", "a", "n"])
+    deferred = {"a": {"status": "deferred", "tries": 0}}
+    recheck = plan_feed([recent], deferred, True, 2, False, None, False, now)
+    check("recheck live", recheck and recheck[0][0] == "queue")
+    erred = {"a": {"status": "error", "tries": 3}}
+    stopped = plan_feed([recent], erred, True, 2, False, None, False, now)
+    check("stop errors", stopped == [])
+    retried = plan_feed([recent], erred, True, 2, False, None, True, now)
+    check("retry errors", retried and retried[0][0] == "queue")
+    cfg = load_config(Path("/does/not/exist-feedopus"))
+    check("default since", cfg["since_days"] == "2")
+    check("ffmeta escape", ffmeta_escape("a=b;c#d\\e\nf") == "a\\=b\\;c\\#d\\\\e\\nf")
+    check(
+        "grayjay name",
+        grayjay_stem("Japanese Tourist learn the hard way 😂") == "Japanese_Tourist_learn_the_hard_way",
+    )
+    check(
+        "grayjay apostrophe",
+        grayjay_stem("I'm making a the move.") == "I_m_making_a_the_move",
+    )
+    check(
+        "grayjay plus",
+        grayjay_stem("FRANCE IS DESTROYED + Craig PISSES OFF the Internet | Side Scrollers Live")
+        == "FRANCE_IS_DESTROYED_+_Craig_PISSES_OFF_the_Internet_Side_Scrollers_Live",
+    )
+    check(
+        "grayjay trailing dots",
+        grayjay_stem("Sony Has Offically Given Up On The PS5...") == "Sony_Has_Offically_Given_Up_On_The_PS5",
+    )
+    check("quiet archive missing", missing_file_outcome(0, "", True, False) == "refetch")
+    check("quiet archive present", missing_file_outcome(0, "", True, True) == "already")
+    check(
+        "spoken archive missing",
+        missing_file_outcome(0, "x has already been recorded in the archive", False, False) == "refetch",
+    )
+    check(
+        "file already there",
+        missing_file_outcome(0, "x has already been downloaded", False, False) == "already",
+    )
+    check("empty success", missing_file_outcome(0, "", False, False) == "error")
+    check("real failure", missing_file_outcome(1, "ERROR: Video unavailable", True, False) == "error")
+    archive_text = "youtube abcdefghijk\nyoutube iubm3yBPqLE\n"
+    check("archive has id", archive_has_id(archive_text, "iubm3yBPqLE"))
+    check("archive ignores prefix", not archive_has_id(archive_text, "iubm3"))
+    check("archive drop", archive_without_id(archive_text, "iubm3yBPqLE") == "youtube abcdefghijk\n")
+    check("archive id", archive_video_id("https://www.youtube.com/watch?v=iubm3yBPqLE") == "iubm3yBPqLE")
+    check(
+        "id in brackets",
+        stem_has_video_id("MentisWave - Title [iubm3yBPqLE]", "iubm3yBPqLE"),
+    )
+    check("id not glued", not stem_has_video_id("iubm3yBPqLEextra", "iubm3yBPqLE"))
+    check("id absent", not stem_has_video_id("An_Actual_Effective_Libertarian_Strategy", "iubm3yBPqLE"))
+    check("looks like feed", looks_like_feed("https://www.youtube.com/feeds/videos.xml?channel_id=UC1"))
+    check("channel url", not looks_like_feed("https://www.youtube.com/@Example"))
+    check(
+        "youtube uploads playlist",
+        youtube_listing_url("https://www.youtube.com/feeds/videos.xml?channel_id=UCIr4vkCsn0tdTW2xZ1jRG1g")
+        == "https://www.youtube.com/playlist?list=UUIr4vkCsn0tdTW2xZ1jRG1g",
+    )
+    check(
+        "youtube playlist feed",
+        youtube_listing_url("https://www.youtube.com/feeds/videos.xml?playlist_id=UULFabcdefghijklmnop")
+        == "https://www.youtube.com/playlist?list=UULFabcdefghijklmnop",
+    )
+    check(
+        "peertube stays rss",
+        youtube_listing_url("https://peertube.example/feeds/videos.xml?videoChannelId=51") is None,
+    )
+    check("channel page stays", youtube_listing_url("https://www.youtube.com/@Example") is None)
+    return 1 if failed else 0
+
+
+HELP_EXAMPLES = """
+examples:
+  feedopus                     check feeds and download
+  feedopus run --dry-run       show decisions without saving
+  feedopus run --backfill 3    take the 3 newest unsaved items per feed
+  feedopus grab URL            save one video
+  feedopus init                write config and import newsboat video feeds
+  feedopus list                show the selected feeds
+  feedopus status              show what has been remembered
+  feedopus install-timer       check about every two hours on Linux
+
+files:
+  ~/.config/feedopus/config    settings (output folder, since_days, thumbnails)
+  ~/.config/feedopus/feeds     one URL per line
+  ~/Sync/podcast               finished audio
+
+man feedopus explains each setting. tldr feedopus shows these examples.
+Run feedopus install-docs if either of those is missing.
+"""
+
+
+def build_parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--config-dir",
+        metavar="DIR",
+        help="directory with config and the feed list (default: ~/.config/feedopus)",
+    )
+    common.add_argument(
+        "--state-dir",
+        metavar="DIR",
+        help="directory for the seen-item database and logs (default: ~/.local/state/feedopus)",
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="feedopus",
+        description=(
+            "Save new videos from selected feeds as Opus audio. "
+            "Livestreams and stream VODs are skipped."
+        ),
+        epilog=HELP_EXAMPLES,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="cmd", metavar="command")
+
+    run = sub.add_parser(
+        "run",
+        parents=[common],
+        help="check feeds and download new audio (the default)",
+        description=(
+            "Check the feed list and save new uploads as Opus audio. "
+            "feedopus with no command does this."
+        ),
+        epilog=HELP_EXAMPLES,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    run.add_argument("--dry-run", action="store_true", help="print decisions without saving files or state")
+    run.add_argument(
+        "--since-days",
+        type=int,
+        metavar="N",
+        help="only items newer than N days. The first visit uses since_days (2) and remembers older items",
+    )
+    run.add_argument(
+        "--backfill",
+        type=int,
+        metavar="N",
+        help="save the N newest unsaved items in each feed and mark the rest seen",
+    )
+    run.add_argument(
+        "--max",
+        dest="max_per_run",
+        type=int,
+        metavar="N",
+        help="stop after N download attempts (default: max_per_run, 8)",
+    )
+    run.add_argument("--retry", action="store_true", help="try items that already failed three times")
+    run.add_argument("--output-dir", metavar="DIR", help="write finished audio here instead of output_dir")
+
+    grab = sub.add_parser(
+        "grab",
+        parents=[common],
+        help="save one video URL as audio",
+        description="Save one video URL as Opus audio, using the same settings as a feed run.",
+    )
+    grab.add_argument("url", help="video page to save")
+    grab.add_argument("--dry-run", action="store_true", help="print the decision without saving")
+    grab.add_argument("--output-dir", metavar="DIR", help="write the file here instead of output_dir")
+
+    init = sub.add_parser("init", parents=[common], help="write config and import newsboat video feeds")
+    init.add_argument("--force", action="store_true", help="overwrite an existing config and feed list")
+
+    sub.add_parser("list", parents=[common], help="show the selected feeds")
+    sub.add_parser("status", parents=[common], help="show remembered items")
+    sub.add_parser("install-timer", help="enable a systemd user timer that checks about every two hours")
+    sub.add_parser("remove-timer", help="disable and remove the systemd user timer")
+    sub.add_parser("install-docs", help="install the manual page and the tldr page")
+    sub.add_parser("self-test", help="run offline checks")
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    if not argv or (argv[0].startswith("-") and argv[0] not in {"-h", "--help"}):
+        argv = ["run", *argv]
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    config_dir, state_dir = (None, None)
+    if hasattr(args, "config_dir"):
+        config_dir, state_dir = resolve_dirs(args)
+    if args.cmd == "run":
+        return cmd_run(args, config_dir, state_dir)
+    if args.cmd == "grab":
+        return cmd_grab(args, config_dir, state_dir)
+    if args.cmd == "init":
+        return cmd_init(config_dir, args.force)
+    if args.cmd == "list":
+        return cmd_list(config_dir)
+    if args.cmd == "status":
+        return cmd_status(state_dir)
+    if args.cmd == "install-timer":
+        return cmd_install_timer()
+    if args.cmd == "remove-timer":
+        return cmd_remove_timer()
+    if args.cmd == "install-docs":
+        return cmd_install_docs()
+    if args.cmd == "self-test":
+        return cmd_self_test()
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        print("\ninterrupted", flush=True)
+        sys.exit(130)

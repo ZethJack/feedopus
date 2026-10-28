@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# Install feedopus for the current user on Linux.
+#
+#   ./install-linux
+#   ./install-linux --state-from /path/to/old/state
+#   ./install-linux --start
+#
+# Copies feedopus into ~/.local/bin (overwriting any existing file), writes
+# config when missing, installs the manual, and enables the two-hour timer.
+# The timer is left stopped unless --start is given. An existing config,
+# feed list, and state are kept.
+set -euo pipefail
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+program=$root/feedopus
+
+usage() {
+    cat <<'EOF'
+Usage: ./install-linux [--state-from DIR] [--start]
+
+Copy feedopus to ~/.local/bin (overwrite), install Python 3.11+, ffmpeg with
+libopus, and yt-dlp when they are missing, and write a config if this user
+has none. Then install the manual and enable the two-hour timer.
+
+--state-from DIR   copy state.json and archive.txt from DIR when this
+                   user does not already have those files
+--start            start the timer now
+EOF
+}
+
+say() {
+    printf '%s\n' "$*"
+}
+
+die() {
+    printf 'install-linux: %s\n' "$*" >&2
+    exit 1
+}
+
+as_root() {
+    if [[ "$(id -u)" -eq 0 ]]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+python_ok() {
+    python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'
+}
+
+opus_ok() {
+    command -v ffmpeg >/dev/null 2>&1 || return 1
+    local encoders
+    encoders=$(ffmpeg -hide_banner -encoders 2>/dev/null || true)
+    [[ "$encoders" == *libopus* ]]
+}
+
+start_timer=0
+state_from=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        --start)
+            start_timer=1
+            ;;
+        --state-from)
+            shift
+            [[ $# -gt 0 ]] || die "--state-from needs a directory"
+            state_from=$1
+            ;;
+        *)
+            die "unknown option: $1 (see --help)"
+            ;;
+    esac
+    shift
+done
+
+[[ "$(uname -s)" == Linux ]] || die "this script is for Linux. On Android, follow the Termux steps in the README."
+[[ -f "$program" ]] || die "feedopus is missing next to this script"
+chmod +x "$program"
+
+have_python=0
+have_opus=0
+have_ytdlp=0
+python_ok && have_python=1
+opus_ok && have_opus=1
+command -v yt-dlp >/dev/null 2>&1 && have_ytdlp=1
+
+if [[ "$have_python" -eq 0 || "$have_opus" -eq 0 || "$have_ytdlp" -eq 0 ]]; then
+    if command -v pacman >/dev/null 2>&1; then
+        pkgs=()
+        [[ "$have_python" -eq 1 ]] || pkgs+=(python)
+        [[ "$have_opus" -eq 1 ]] || pkgs+=(ffmpeg)
+        [[ "$have_ytdlp" -eq 1 ]] || pkgs+=(yt-dlp)
+        say "installing: ${pkgs[*]}"
+        as_root pacman -S --needed --noconfirm "${pkgs[@]}"
+    elif command -v apt-get >/dev/null 2>&1; then
+        pkgs=()
+        [[ "$have_python" -eq 1 ]] || pkgs+=(python3)
+        [[ "$have_opus" -eq 1 ]] || pkgs+=(ffmpeg)
+        [[ "$have_ytdlp" -eq 1 ]] || pkgs+=(yt-dlp)
+        say "installing: ${pkgs[*]}"
+        as_root apt-get update
+        as_root apt-get install -y "${pkgs[@]}"
+        if ! command -v yt-dlp >/dev/null 2>&1; then
+            as_root apt-get install -y python3-pip
+            python3 -m pip install --user -U yt-dlp
+        fi
+    elif command -v dnf >/dev/null 2>&1; then
+        pkgs=()
+        [[ "$have_python" -eq 1 ]] || pkgs+=(python3)
+        [[ "$have_opus" -eq 1 ]] || pkgs+=(ffmpeg)
+        [[ "$have_ytdlp" -eq 1 ]] || pkgs+=(yt-dlp)
+        say "installing: ${pkgs[*]}"
+        as_root dnf install -y "${pkgs[@]}"
+        if ! command -v yt-dlp >/dev/null 2>&1; then
+            as_root dnf install -y python3-pip
+            python3 -m pip install --user -U yt-dlp
+        fi
+    else
+        die "install Python 3.11 or newer, ffmpeg with libopus, and yt-dlp, then run this again"
+    fi
+fi
+
+export PATH="${HOME}/.local/bin:${PATH}"
+python_ok || die "Python 3.11 or newer is required. python3 is $(python3 --version 2>&1 || true)"
+opus_ok || die "ffmpeg is installed without the libopus encoder"
+command -v yt-dlp >/dev/null 2>&1 || die "yt-dlp is still missing"
+
+bindir=${HOME}/.local/bin
+mkdir -p "$bindir"
+# Remove a previous symlink so install does not write through it into the tree.
+if [[ -L "${bindir}/feedopus" ]]; then
+    rm -f "${bindir}/feedopus"
+fi
+install -m 755 "$program" "${bindir}/feedopus"
+say "installed ${bindir}/feedopus"
+case ":${PATH}:" in
+    *":${bindir}:"*) ;;
+    *)
+        say "add ${bindir} to PATH before opening a new terminal"
+        ;;
+esac
+
+config_home=${XDG_CONFIG_HOME:-${HOME}/.config}
+config_dir=${config_home}/feedopus
+mkdir -p "$config_dir"
+if [[ ! -f "${config_dir}/config" || ! -f "${config_dir}/feeds" ]]; then
+    "${bindir}/feedopus" init || say "add feed URLs to ${config_dir}/feeds"
+fi
+
+python3 - "$config_dir" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+config_dir = Path(sys.argv[1])
+cfg = config_dir / "config"
+feeds = config_dir / "feeds"
+if not cfg.is_file():
+    raise SystemExit(0)
+text = cfg.read_text(encoding="utf-8")
+newline = "\n" if text.endswith("\n") or text == "" else ""
+lines = text.splitlines()
+for index, line in enumerate(lines):
+    stripped = line.strip()
+    if stripped.startswith("#") or not stripped.startswith("feeds_file"):
+        continue
+    _, separator, value = line.partition("=")
+    if separator != "=":
+        break
+    raw = os.path.expanduser(os.path.expandvars(value.strip()))
+    if not raw or Path(raw).is_file():
+        break
+    if not feeds.is_file():
+        break
+    lines[index] = f"feeds_file = {feeds}"
+    cfg.write_text("\n".join(lines) + newline, encoding="utf-8")
+    print(f"feeds_file pointed at a missing path; now {feeds}")
+    break
+PY
+
+if [[ -n "$state_from" ]]; then
+    state_from=$(python3 -c 'import os, sys; print(os.path.expanduser(sys.argv[1]))' "$state_from")
+    [[ -d "$state_from" ]] || die "state directory not found: ${state_from}"
+    state_home=${XDG_STATE_HOME:-${HOME}/.local/state}
+    state_dir=${state_home}/feedopus
+    mkdir -p "$state_dir"
+    for name in state.json archive.txt; do
+        source=${state_from}/${name}
+        dest=${state_dir}/${name}
+        if [[ ! -f "$source" ]]; then
+            say "no ${name} in ${state_from}"
+            continue
+        fi
+        if [[ -f "$dest" ]]; then
+            say "keeping existing ${dest}"
+            continue
+        fi
+        cp "$source" "$dest"
+        say "copied ${name} to ${dest}"
+    done
+fi
+
+# install-docs looks for feedopus.1 next to the program file; run from the
+# source tree so a copied ~/.local/bin/feedopus still finds the pages.
+"$program" install-docs
+"${bindir}/feedopus" install-timer
+if [[ "$start_timer" -eq 1 ]]; then
+    systemctl --user start feedopus.timer
+    say "timer started"
+else
+    say "timer enabled. Start it with: systemctl --user start feedopus.timer"
+fi
+say "check the feeds with: feedopus run --dry-run"

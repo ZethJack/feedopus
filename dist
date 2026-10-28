@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Write feedopus-VERSION.tar.gz from the latest git commit.
+# Unpack that archive and run ./install-linux to copy it over an older install.
+set -euo pipefail
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$root"
+
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    printf 'dist: %s is not a git repository\n' "$root" >&2
+    exit 1
+fi
+
+version=$(tr -d '[:space:]' < VERSION)
+if [[ -z "$version" ]]; then
+    printf 'dist: VERSION is empty\n' >&2
+    exit 1
+fi
+
+if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+    printf 'dist: uncommitted changes are not included; the archive is HEAD\n' >&2
+fi
+
+out="${root}/feedopus-${version}.tar.gz"
+git archive --format=tar.gz --prefix="feedopus-${version}/" -o "$out" HEAD
+printf '%s\n' "$out"

@@ -1,0 +1,431 @@
+.TH FEEDOPUS 1 "October 2026" "feedopus" "User Commands"
+.SH NAME
+feedopus \- save new videos from selected feeds as Opus audio
+.SH SYNOPSIS
+.B feedopus
+.RI [ run-option ]...
+.br
+.B feedopus run
+.RI [ option ]...
+.br
+.B feedopus grab
+.RB [ \-\-dry\-run ]
+.RB [ \-\-output\-dir
+.IR dir ]
+.I url
+.br
+.B feedopus init
+.RB [ \-\-force ]
+.br
+.B feedopus list
+.br
+.B feedopus status
+.br
+.B feedopus install\-timer
+.br
+.B feedopus remove\-timer
+.br
+.B feedopus install\-docs
+.br
+.B feedopus self\-test
+.SH DESCRIPTION
+.B feedopus
+reads the feeds you select and saves new uploads as Opus audio.
+Livestreams, upcoming streams, and archived livestreams (stream VODs) are skipped.
+The video thumbnail is embedded as cover art inside the Opus file.
+Finished files go to
+.I ~/Sync/podcast
+unless
+.B output_dir
+points somewhere else.
+Partial downloads stay in the state directory, so Syncthing does not sync a half-written file.
+.PP
+With no command,
+.B feedopus
+does what
+.B run
+does.
+A first argument that starts with a dash is also passed to
+.BR run ,
+except
+.B \-h
+and
+.BR \-\-help .
+.PP
+The same program runs on Linux and in Termux on Android.
+It needs Python 3.11 or newer, yt-dlp, and ffmpeg with libopus.
+.SH COMMANDS
+.TP
+.B run
+Check the feed list and download new audio. This is the default command.
+.TP
+.BI grab " url"
+Save one video URL as audio. The URL is also checked against audio already in the output folder.
+.TP
+.B init
+Write
+.I ~/.config/feedopus/config
+and
+.IR ~/.config/feedopus/feeds .
+Video feeds found in newsboat's URL file are copied in. Blogs and distro news are left out.
+.B \-\-force
+overwrites both files.
+.TP
+.B list
+Print the selected feeds.
+.TP
+.B status
+Print how many items are remembered, grouped as downloaded, skipped, seen, deferred, and error.
+.TP
+.B install\-timer
+Write and enable a systemd user timer that runs about every two hours, at :20 past even hours.
+It does not start the timer.
+Start it with
+.BR "systemctl \-\-user start feedopus.timer" .
+.TP
+.B remove\-timer
+Disable that timer and delete its unit files.
+.TP
+.B install\-docs
+Install this manual and the tldr page for the current user.
+.TP
+.B self\-test
+Run offline checks. Nothing is downloaded.
+.SH OPTIONS
+Options for
+.B run
+can be given with or without the
+.B run
+word.
+.B grab
+accepts
+.BR \-\-dry\-run ,
+.BR \-\-output\-dir ,
+.BR \-\-config\-dir ,
+and
+.BR \-\-state\-dir .
+.TP
+.B \-\-dry\-run
+Decide what would be saved. Files and state are left unchanged.
+.TP
+.BI \-\-since\-days " N"
+Only consider items newer than
+.I N
+days.
+The first time a feed is read, this window comes from the
+.B since_days
+setting (default 2), and older items are marked seen.
+On later runs, new items are downloaded at any age.
+Passing this option applies the window on those later runs as well.
+.TP
+.BI \-\-backfill " N"
+From each feed, take the
+.I N
+newest items that are not already saved, and mark the rest seen.
+.TP
+.BI \-\-max " N"
+Stop after
+.I N
+download attempts. The default is the
+.B max_per_run
+setting (8).
+Items skipped because they are still live do not count toward this limit.
+.TP
+.B \-\-retry
+Try items that have already failed three times.
+.TP
+.BI \-\-output\-dir " dir"
+Write finished audio here for this run, instead of the
+.B output_dir
+setting.
+.TP
+.BI \-\-config\-dir " dir"
+Directory that holds
+.I config
+and the feed list.
+The default is
+.IR ~/.config/feedopus ,
+or
+.I $XDG_CONFIG_HOME/feedopus
+when that variable is set.
+.TP
+.BI \-\-state\-dir " dir"
+Directory for the seen-item database, the yt-dlp archive, the log, and partial downloads.
+The default is
+.IR ~/.local/state/feedopus ,
+or
+.I $XDG_STATE_HOME/feedopus
+when that variable is set.
+.TP
+.BR \-h ", " \-\-help
+Show a short reminder of the commands.
+.B "feedopus run \-\-help"
+shows the options for a run.
+.SH FILES
+.TP
+.I ~/.config/feedopus/config
+Settings, one
+.B key = value
+per line.
+A line that starts with # is a comment.
+A ~ in a path is expanded.
+Percent signs are kept as written, which is what the filename template needs.
+.TP
+.I ~/.config/feedopus/feeds
+One URL per line, in newsboat style:
+.RS
+.EX
+https://www.youtube.com/feeds/videos.xml?channel_id=UCxxxx "Channel name"
+https://www.youtube.com/@Channel "Channel name"
+.EE
+.RE
+.IP
+An optional tag may follow the name.
+A YouTube address of the form
+.I feeds/videos.xml?channel_id=UCxxxx
+is read from that channel's uploads playlist, the same id with
+.B UC
+changed to
+.BR UU .
+The public RSS host often returns 404 or 500.
+A
+.I playlist_id
+on that host is read as that playlist.
+Other RSS and Atom URLs are read directly.
+Any other URL is treated as a channel or playlist, and only the newest
+.B playlist_end
+entries are considered (default 15).
+.TP
+.I ~/Sync/podcast
+Finished audio, unless
+.B output_dir
+says otherwise.
+On Android, if that directory does not exist,
+.I ~/storage/music/podcast
+or
+.I ~/storage/shared/podcast
+is used when present.
+.TP
+.I ~/.local/state/feedopus/state.json
+Items already considered, and which feeds have been caught up.
+.TP
+.I ~/.local/state/feedopus/archive.txt
+yt-dlp download archive.
+A listed video whose audio file is no longer in the output folder is downloaded again.
+That case is not reported as an error.
+.TP
+.I ~/.local/state/feedopus/tmp
+Partial downloads and thumbnail files. Old partials are removed after 7 days.
+.TP
+.I ~/.local/state/feedopus/feedopus.log
+Log of recent runs.
+.TP
+.I ~/.config/systemd/user/feedopus.timer
+User timer written by
+.BR install\-timer ,
+together with
+.IR feedopus.service .
+The timer runs
+.B feedopus run
+about every two hours.
+.SH CONFIGURATION
+These keys live in the config file. The values below are the defaults.
+.TP
+.B output_dir
+Directory for finished files.
+Default:
+.IR ~/Sync/podcast .
+.TP
+.B filename
+yt-dlp output template, relative to the output directory.
+Default:
+.EX
+%(title)s.%(ext)s
+.EE
+The finished file is renamed to the title alone, with spaces and punctuation
+written as underscores and emoji removed, so it matches a Grayjay download.
+A period at the end of the title is dropped, so the extension is the only dot.
+.TP
+.B audio_format
+Container written by yt-dlp.
+Default:
+.IR opus .
+.TP
+.B audio_quality
+Passed through to yt-dlp.
+Default:
+.I 0
+(best).
+.TP
+.B embed_thumbnail
+Embed the video thumbnail as JPEG cover art, the same kind of picture Grayjay stores.
+Default:
+.IR true .
+The audio is copied, not re-encoded.
+If the thumbnail cannot be fetched, the audio is still kept and the log says that cover art was not embedded.
+.TP
+.B sponsorblock
+SponsorBlock categories to cut, separated by commas.
+Default:
+.IR sponsor,selfpromo,interaction .
+An empty value keeps the whole recording.
+.TP
+.B since_days
+Age window used the first time a feed is read.
+Default:
+.IR 2 .
+.TP
+.B max_per_run
+Maximum downloads in one run.
+Default:
+.IR 8 .
+.TP
+.B skip_live
+Skip videos that are live or scheduled to go live.
+Default:
+.IR true .
+Those items are checked again on a later run.
+.TP
+.B skip_was_live
+Skip the saved recording of a livestream.
+Default:
+.IR true .
+A normal video that YouTube premiered is sometimes labeled as a past livestream, and is then skipped while this is true.
+.TP
+.B live_give_up_days
+Stop rechecking a livestream after this many days.
+Default:
+.IR 14 .
+.TP
+.B playlist_end
+How many recent videos to read from a channel or playlist URL.
+Default:
+.IR 15 .
+.TP
+.B sleep_seconds
+Pause between yt-dlp calls.
+Default:
+.IR 1 .
+.TP
+.B download_timeout_minutes
+Give up on one download after this many minutes.
+Default:
+.IR 45 .
+.TP
+.B cookies
+Path of a Netscape cookies file, for age-restricted videos.
+Empty means no cookies file.
+.TP
+.B extra_args
+Extra arguments appended to every yt-dlp download, written in shell syntax.
+Empty by default.
+.TP
+.B notify
+Send a notification when a run saves files or hits errors.
+Uses notify-send, or a Termux notification when that is what is installed.
+Default:
+.IR true .
+.TP
+.B windows_filenames
+Ask yt-dlp to avoid characters that phone storage rejects.
+Default:
+.IR true .
+.TP
+.B feeds_file
+Path of the feed list.
+The default is
+.I feeds
+inside the config directory.
+.TP
+.B require_tag
+When set, only feed lines that carry this tag are used.
+Empty uses every line.
+.SH "FIRST VISIT"
+The first time a feed is read, only items newer than
+.B since_days
+are candidates.
+Older items, and items with no date, are marked seen and left alone.
+Later runs download anything in the feed that has not been seen.
+A feed that could not be fetched is not treated as caught up, so the next run tries the first-visit window again.
+.PP
+.B "run \-\-backfill N"
+takes the
+.I N
+newest unsaved items from each feed and marks the rest seen.
+Those selected items are still saved from oldest to newest.
+.SH ORDER
+Each channel is saved from oldest to newest.
+Channels take turns, following the order of the feed list, so the first channel does not use every download slot in the run.
+An entry with no date is saved after the dated ones from that channel.
+.SH DUPLICATES
+A title that matches audio already in the output folder is skipped, including a Grayjay download whose name lost its emoji and punctuation or was cut short.
+Letters and digits are compared, and apostrophes are ignored, so a title like "I'm" matches a file named with "I_m" or "Im".
+A title that only adds a number, such as "Title 2", is still downloaded.
+The same upload seen on YouTube and again on Odysee is saved once.
+Two different videos that share a long opening can be treated as the same file.
+.PP
+Run
+.B feedopus
+on one device at a time.
+Two devices that have not synced the finished file yet can each download a copy.
+.SH INSTALL
+On Linux, from a copy of the project directory:
+.EX
+\&./install\-linux
+.EE
+This copies the program to
+.IR ~/.local/bin/feedopus ,
+replacing any older file or symlink there.
+It installs Python 3.11 or newer, ffmpeg with libopus, and yt-dlp when they are missing,
+writes a config if this user has none, replaces this manual and the tldr page, and enables the timer.
+It does not start the timer.
+.B \-\-start
+starts it.
+.B \-\-state\-from
+.I dir
+copies
+.I state.json
+and
+.I archive.txt
+from
+.I dir
+when this user does not already have those files.
+An existing config and feed list are kept.
+If
+.B feeds_file
+names a path that is not on this machine, it is pointed at
+.I ~/.config/feedopus/feeds
+when that file exists.
+.SH ANDROID
+Install Termux, then Python, ffmpeg, and yt-dlp.
+Copy this program onto
+.I $PREFIX/bin
+and copy
+.I ~/.config/feedopus/
+from the computer.
+.B install\-timer
+needs systemd and is the Linux schedule.
+A Termux:Boot loop that sleeps two hours between runs is in the project README.
+.B install\-docs
+installs the manual and the tldr page when those viewers are available.
+The manual, the tldr page, and
+.I fish/tldr.fish
+have to sit next to the program file for that command to find them.
+.SH EXAMPLES
+.EX
+feedopus
+feedopus run \-\-dry\-run
+feedopus run \-\-backfill 3
+feedopus run \-\-since\-days 7 \-\-max 2
+feedopus grab 'https://www.youtube.com/watch?v=VIDEO_ID'
+feedopus init
+feedopus list
+feedopus status
+feedopus install\-timer
+systemctl \-\-user start feedopus.timer
+feedopus install\-docs
+.EE
+.SH "SEE ALSO"
+.BR yt\-dlp (1),
+.BR ffmpeg (1),
+.BR newsboat (1)
