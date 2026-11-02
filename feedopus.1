@@ -325,6 +325,14 @@ Default:
 Path of a Netscape cookies file, for age-restricted videos.
 Empty means no cookies file.
 .TP
+.B cookies_from_browser
+Read cookies from a browser instead of
+.BR cookies .
+A Chromium-family browser on Hyprland needs the keyring named, for example
+.BR brave+gnomekeyring .
+This needs the Python secretstorage module.
+Empty by default.
+.TP
 .B extra_args
 Extra arguments appended to every yt-dlp download, written in shell syntax.
 Empty by default.

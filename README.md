@@ -43,6 +43,8 @@ https://www.youtube.com/@Channel "Channel name"
 
 YouTube RSS is tried first. If that request fails, the channel's uploads playlist is checked. Other RSS and Atom feeds are read directly. Any other URL is a channel or playlist.
 
+If YouTube asks for a sign-in, set `cookies_from_browser` (for example `brave+gnomekeyring`). That reads the browser's own cookies. On Hyprland the keyring name is required, and Python's `secretstorage` module has to be installed.
+
 The first visit to a feed takes items from the last two days and remembers the rest. Later runs take anything new. `feedopus run --backfill 3` takes the three newest unsaved items from each feed. Within a channel, files are saved oldest first, and channels take turns.
 
 Files are named from the title, with spaces and punctuation written as underscores, so a Grayjay download of the same video is recognized. A file already in the folder is skipped. Deleting a file does not forget the episode.
