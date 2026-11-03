@@ -524,15 +524,15 @@ def entry_date(node: ET.Element) -> datetime | None:
 def youtube_id(url: str) -> str:
     parsed = urllib.parse.urlparse(url)
     host = parsed.netloc.lower().removeprefix("www.").removeprefix("m.")
-    if host in {"youtube.com", "music.youtube.com"}:
-        query = urllib.parse.parse_qs(parsed.query)
-        video = query.get("v", [""])[0]
-        if video:
-            return f"yt:{video}"
-    if host == "youtu.be":
-        video = parsed.path.strip("/").split("/")[0]
-        if video:
-            return f"yt:{video}"
+    match host:
+        case "youtube.com" | "music.youtube.com":
+            video = urllib.parse.parse_qs(parsed.query).get("v", [""])[0]
+            if video:
+                return f"yt:{video}"
+        case "youtu.be":
+            video = parsed.path.strip("/").split("/")[0]
+            if video:
+                return f"yt:{video}"
     return ""
 
 
@@ -611,20 +611,20 @@ def parse_feed_xml(data: bytes, feed: Feed) -> list[Entry]:
     if data.startswith(b"\xef\xbb\xbf"):
         data = data[3:]
     root = ET.fromstring(data)
-    tag = local_name(root.tag)
-    if tag == "feed":
-        channel = root
-        nodes = children(root, "entry")
-        fallback_author = feed_author(root)
-        channel_title = child_text(root, "title")
-    elif tag == "rss":
-        channels = children(root, "channel")
-        channel = channels[0] if channels else root
-        nodes = children(channel, "item")
-        fallback_author = feed_author(channel)
-        channel_title = child_text(channel, "title")
-    else:
-        raise ValueError(f"unknown feed type <{tag}>")
+    match local_name(root.tag):
+        case "feed":
+            channel = root
+            nodes = children(root, "entry")
+            fallback_author = feed_author(root)
+            channel_title = child_text(root, "title")
+        case "rss":
+            channels = children(root, "channel")
+            channel = channels[0] if channels else root
+            nodes = children(channel, "item")
+            fallback_author = feed_author(channel)
+            channel_title = child_text(channel, "title")
+        case tag:
+            raise ValueError(f"unknown feed type <{tag}>")
     display = feed.name or channel_title or fallback_author or urllib.parse.urlparse(feed.url).netloc
     entries: list[Entry] = []
     seen: set[str] = set()
@@ -683,15 +683,17 @@ def youtube_listing_url(url: str) -> str | None:
     channel_id = (query.get("channel_id") or [""])[0].strip()
     playlist_id = (query.get("playlist_id") or [""])[0].strip()
     user = (query.get("user") or [""])[0].strip()
-    if channel_id.startswith("UC") and len(channel_id) > 2:
-        playlist_id = "UU" + channel_id[2:]
-    elif channel_id:
-        return f"https://www.youtube.com/channel/{urllib.parse.quote(channel_id)}/videos"
-    if playlist_id:
-        return "https://www.youtube.com/playlist?list=" + urllib.parse.quote(playlist_id)
-    if user:
-        return f"https://www.youtube.com/user/{urllib.parse.quote(user)}/videos"
-    return None
+    match (channel_id, playlist_id, user):
+        case (cid, _, _) if cid.startswith("UC") and len(cid) > 2:
+            return "https://www.youtube.com/playlist?list=" + urllib.parse.quote("UU" + cid[2:])
+        case (cid, _, _) if cid:
+            return f"https://www.youtube.com/channel/{urllib.parse.quote(cid)}/videos"
+        case (_, pid, _) if pid:
+            return "https://www.youtube.com/playlist?list=" + urllib.parse.quote(pid)
+        case (_, _, name) if name:
+            return f"https://www.youtube.com/user/{urllib.parse.quote(name)}/videos"
+        case _:
+            return None
 
 
 def fetch_subscription(
@@ -737,12 +739,13 @@ def fetch_subscription(
                 page = f"https://www.youtube.com/watch?v={video}"
             else:
                 continue
-        if video and video != "NA" and ("youtube" in feed.url or youtube_id(page)):
-            entry_id = f"yt:{video}"
-        elif video and video != "NA":
-            entry_id = video
-        else:
-            entry_id = page
+        match video:
+            case vid if vid and vid != "NA" and ("youtube" in feed.url or youtube_id(page)):
+                entry_id = f"yt:{vid}"
+            case vid if vid and vid != "NA":
+                entry_id = vid
+            case _:
+                entry_id = page
         if entry_id in seen:
             continue
         published = None
@@ -803,12 +806,13 @@ def select_action(
     --since-days. In that case every unseen item is new.
     """
     if prev:
-        status = prev.get("status")
-        if status == "deferred":
-            return "queue"
-        if status == "error" and (retry or int(prev.get("tries") or 0) < 3):
-            return "queue"
-        return "ignore"
+        match prev.get("status"):
+            case "deferred":
+                return "queue"
+            case "error" if retry or int(prev.get("tries") or 0) < 3:
+                return "queue"
+            case _:
+                return "ignore"
     if window is None and feed_bootstrapped:
         return "queue"
     if published is None:
@@ -859,14 +863,12 @@ def plan_feed(
 
     for entry in oldest_first:
         choice = select_action(items.get(entry.id), entry.published, feed_bootstrapped, window, now, retry)
-        if choice == "queue":
-            actions.append(("queue", entry))
-        elif choice == "seen":
-            if entry.published is None:
-                detail = "undated on first fetch"
-            else:
-                detail = f"older than {window} days"
-            actions.append(("seen", entry, detail))
+        match choice:
+            case "queue":
+                actions.append(("queue", entry))
+            case "seen":
+                detail = "undated on first fetch" if entry.published is None else f"older than {window} days"
+                actions.append(("seen", entry, detail))
     return actions
 
 
@@ -877,11 +879,13 @@ def classify(live_status: str, was_live: str, is_live: str, skip_live: bool, ski
     status = (live_status or "").strip().lower()
     was = (was_live or "").strip().lower() in {"true", "1", "yes"}
     live = (is_live or "").strip().lower() in {"true", "1", "yes"}
-    if status == "was_live" or was:
-        return "skip" if skip_was_live else "download"
-    if live or status in {"is_live", "is_upcoming", "post_live"}:
-        return "defer"
-    return "download"
+    match (status, was, live):
+        case ("was_live", _, _) | (_, True, _):
+            return "skip" if skip_was_live else "download"
+        case ("is_live" | "is_upcoming" | "post_live", _, _) | (_, _, True):
+            return "defer"
+        case _:
+            return "download"
 
 
 def live_is_stale(entry: Entry, prev: dict | None, now: datetime, days: int) -> bool:
@@ -941,13 +945,13 @@ def save_state(path: Path, state: dict) -> None:
 
 def record(state: dict, entry: Entry, result: Result, prev: dict | None, now: datetime) -> None:
     stamp = now.isoformat()
-    if result.status == "error":
-        if prev and prev.get("status") == "error":
+    match result.status:
+        case "error" if prev and prev.get("status") == "error":
             tries = int(prev.get("tries") or 0) + 1
-        else:
+        case "error":
             tries = 1
-    else:
-        tries = 0
+        case _:
+            tries = 0
     first_seen = stamp
     if prev and prev.get("first_seen"):
         first_seen = str(prev["first_seen"])
@@ -1113,19 +1117,21 @@ def jpeg_size(data: bytes) -> tuple[int, int]:
             index += 1
             continue
         marker = data[index + 1]
-        if marker in (0xC0, 0xC1, 0xC2):
-            height = int.from_bytes(data[index + 5 : index + 7], "big")
-            width = int.from_bytes(data[index + 7 : index + 9], "big")
-            return width, height
-        if marker in (0xD8, 0xD9):
-            index += 2
-            continue
-        if index + 4 > len(data):
-            break
-        length = int.from_bytes(data[index + 2 : index + 4], "big")
-        if length < 2:
-            break
-        index += 2 + length
+        match marker:
+            case 0xC0 | 0xC1 | 0xC2:
+                height = int.from_bytes(data[index + 5 : index + 7], "big")
+                width = int.from_bytes(data[index + 7 : index + 9], "big")
+                return width, height
+            case 0xD8 | 0xD9:
+                index += 2
+                continue
+            case _ if index + 4 > len(data):
+                break
+            case _:
+                length = int.from_bytes(data[index + 2 : index + 4], "big")
+                if length < 2:
+                    break
+                index += 2 + length
     return 0, 0
 
 
@@ -1156,14 +1162,15 @@ def ffmeta_escape(value: str) -> str:
     """Escape a value for an ffmetadata file. Base64 padding contains '='."""
     escaped = []
     for char in value:
-        if char == "\n":
-            escaped.append("\\n")
-        elif char == "\r":
-            escaped.append("\\r")
-        elif char in "\\=;#":
-            escaped.append("\\" + char)
-        else:
-            escaped.append(char)
+        match char:
+            case "\n":
+                escaped.append("\\n")
+            case "\r":
+                escaped.append("\\r")
+            case "\\" | "=" | ";" | "#":
+                escaped.append("\\" + char)
+            case _:
+                escaped.append(char)
     return "".join(escaped)
 
 
@@ -1425,21 +1432,20 @@ def download(
             return Result("downloaded", "saved", saved)
         existing = audio_named_for(output_dir, video_id, title)
         outcome = missing_file_outcome(result.code, text, was_archived, existing is not None)
-        if outcome == "already":
-            return Result("downloaded", "already saved", str(existing) if existing else "")
-        if outcome == "refetch" and attempt == 1:
-            if not video_id:
-                return Result("error", "the archive lists this video, but the audio file is missing")
-            forget_archived(archive_path, video_id)
-            log("archive listed this video, but the audio file is missing; downloading it again")
-            continue
-        detail = one_line(result.err or result.out)
-        if not detail:
-            if result.code == 0:
-                detail = "yt-dlp finished without a file"
-            else:
-                detail = f"yt-dlp exited {result.code}"
-        return Result("error", detail)
+        match outcome:
+            case "already":
+                return Result("downloaded", "already saved", str(existing) if existing else "")
+            case "refetch" if attempt == 1:
+                if not video_id:
+                    return Result("error", "the archive lists this video, but the audio file is missing")
+                forget_archived(archive_path, video_id)
+                log("archive listed this video, but the audio file is missing; downloading it again")
+                continue
+            case _:
+                detail = one_line(result.err or result.out)
+                if not detail:
+                    detail = "yt-dlp finished without a file" if result.code == 0 else f"yt-dlp exited {result.code}"
+                return Result("error", detail)
     return Result("error", "yt-dlp finished without a file")
 
 
@@ -1485,28 +1491,30 @@ def process_entry(
         as_bool(cfg["skip_live"]),
         as_bool(cfg["skip_was_live"]),
     )
-    if decision == "skip":
-        return Result("skipped", f"livestream VOD ({live_status or 'was_live'})")
-    if decision == "defer":
-        give_up = as_int(cfg["live_give_up_days"], "live_give_up_days")
-        if live_is_stale(entry, prev, now, give_up):
-            return Result("skipped", f"livestream left alone after {give_up} days")
-        return Result("deferred", live_status or "live")
-    if dry_run:
-        seen.add_title(entry.title)
-        return Result("downloaded", "dry-run")
-    saved = download(entry.url, cfg, output_dir, state_dir, cookies, entry.title, browser)
-    if saved.status == "downloaded":
-        seen.add_title(entry.title)
-        if saved.detail == "saved" and saved.path:
-            final = place_like_grayjay(Path(saved.path), entry.title)
-            saved = Result(saved.status, saved.detail, str(final))
-            seen.add_stem(final.stem)
-        elif saved.path:
-            # Already on disk. Remember the name, and do not rename that file.
-            seen.add_stem(Path(saved.path).stem)
-            saved = Result(saved.status, saved.detail, "")
-    return saved
+    match decision:
+        case "skip":
+            return Result("skipped", f"livestream VOD ({live_status or 'was_live'})")
+        case "defer":
+            give_up = as_int(cfg["live_give_up_days"], "live_give_up_days")
+            if live_is_stale(entry, prev, now, give_up):
+                return Result("skipped", f"livestream left alone after {give_up} days")
+            return Result("deferred", live_status or "live")
+        case _ if dry_run:
+            seen.add_title(entry.title)
+            return Result("downloaded", "dry-run")
+        case _:
+            saved = download(entry.url, cfg, output_dir, state_dir, cookies, entry.title, browser)
+            if saved.status == "downloaded":
+                seen.add_title(entry.title)
+                if saved.detail == "saved" and saved.path:
+                    final = place_like_grayjay(Path(saved.path), entry.title)
+                    saved = Result(saved.status, saved.detail, str(final))
+                    seen.add_stem(final.stem)
+                elif saved.path:
+                    # Already on disk. Remember the name, and do not rename that file.
+                    seen.add_stem(Path(saved.path).stem)
+                    saved = Result(saved.status, saved.detail, "")
+            return saved
 
 
 # --- logging and notifications ----------------------------------------------
@@ -1840,14 +1848,15 @@ def run_locked(
         seen_count = 0
         undated = 0
         for action in actions:
-            if action[0] == "queue":
-                queued.append(action[1])
-            else:
-                seen_count += 1
-                if action[2] == "undated on first fetch":
-                    undated += 1
-                if not args.dry_run:
-                    record(state, action[1], Result("seen", action[2]), state["items"].get(action[1].id), now)
+            match action:
+                case ("queue", entry):
+                    queued.append(entry)
+                case (_, entry, detail):
+                    seen_count += 1
+                    if detail == "undated on first fetch":
+                        undated += 1
+                    if not args.dry_run:
+                        record(state, entry, Result("seen", detail), state["items"].get(entry.id), now)
         if not args.dry_run:
             state["feeds"][feed.url] = {
                 "bootstrapped": True,
@@ -1905,20 +1914,21 @@ def run_locked(
         if not args.dry_run:
             record(state, entry, result, state["items"].get(entry.id), now)
             save_state(state_path, state)
-        if result.status == "downloaded":
-            where = pretty(result.path)
-            suffix = f" -> {where}" if where else ""
-            log(f"saved     {label(entry)}{suffix}")
-            saved.append(label(entry) + (f"\n{where}" if where else ""))
-        elif result.status == "skipped":
-            skipped += 1
-            log(f"skip      {label(entry)} ({result.detail})")
-        elif result.status == "deferred":
-            deferred += 1
-            log(f"defer     {label(entry)} ({result.detail})")
-        else:
-            errors += 1
-            log(f"error     {label(entry)} ({result.detail})")
+        match result.status:
+            case "downloaded":
+                where = pretty(result.path)
+                suffix = f" -> {where}" if where else ""
+                log(f"saved     {label(entry)}{suffix}")
+                saved.append(label(entry) + (f"\n{where}" if where else ""))
+            case "skipped":
+                skipped += 1
+                log(f"skip      {label(entry)} ({result.detail})")
+            case "deferred":
+                deferred += 1
+                log(f"defer     {label(entry)} ({result.detail})")
+            case _:
+                errors += 1
+                log(f"error     {label(entry)} ({result.detail})")
 
     if not ordered:
         log("nothing new")
@@ -2416,28 +2426,30 @@ def main(argv: list[str]) -> int:
     config_dir, state_dir = (None, None)
     if hasattr(args, "config_dir"):
         config_dir, state_dir = resolve_dirs(args)
-    if args.cmd == "run":
-        return cmd_run(args, config_dir, state_dir)
-    if args.cmd == "grab":
-        return cmd_grab(args, config_dir, state_dir)
-    if args.cmd == "init":
-        return cmd_init(config_dir, args.force)
-    if args.cmd == "list":
-        return cmd_list(config_dir)
-    if args.cmd == "status":
-        return cmd_status(state_dir)
-    if args.cmd == "clean":
-        return cmd_clean(args, config_dir, state_dir)
-    if args.cmd == "install-timer":
-        return cmd_install_timer()
-    if args.cmd == "remove-timer":
-        return cmd_remove_timer()
-    if args.cmd == "install-docs":
-        return cmd_install_docs()
-    if args.cmd == "self-test":
-        return cmd_self_test()
-    parser.print_help()
-    return 2
+    match args.cmd:
+        case "run":
+            return cmd_run(args, config_dir, state_dir)
+        case "grab":
+            return cmd_grab(args, config_dir, state_dir)
+        case "init":
+            return cmd_init(config_dir, args.force)
+        case "list":
+            return cmd_list(config_dir)
+        case "status":
+            return cmd_status(state_dir)
+        case "clean":
+            return cmd_clean(args, config_dir, state_dir)
+        case "install-timer":
+            return cmd_install_timer()
+        case "remove-timer":
+            return cmd_remove_timer()
+        case "install-docs":
+            return cmd_install_docs()
+        case "self-test":
+            return cmd_self_test()
+        case _:
+            parser.print_help()
+            return 2
 
 
 if __name__ == "__main__":
