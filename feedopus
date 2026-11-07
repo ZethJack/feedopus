@@ -722,7 +722,7 @@ def fetch_subscription(
     auth = yt_auth_args(cookies, browser)
     if auth:
         cmd[1:1] = auth
-    result = run_cmd(cmd, PROBE_TIMEOUT)
+    result = run_ytdlp(cmd, PROBE_TIMEOUT, browser)
     if result.code != 0 and not result.out.strip():
         detail = one_line(result.err or result.out) or f"yt-dlp exited {result.code}"
         raise RuntimeError(detail)
@@ -994,6 +994,35 @@ def run_cmd(cmd: list[str], timeout: int) -> CmdResult:
     return CmdResult(proc.returncode or 0, out or "", err or "")
 
 
+def without_auth(cmd: list[str]) -> list[str]:
+    stripped: list[str] = []
+    skip = False
+    for arg in cmd:
+        if skip:
+            skip = False
+            continue
+        if arg in {"--cookies", "--cookies-from-browser"}:
+            skip = True
+            continue
+        stripped.append(arg)
+    return stripped
+
+
+def cookie_keyring_failed(result: CmdResult) -> bool:
+    # secretstorage raises "Item does not exist!" before yt-dlp talks to YouTube.
+    # A real missing video names the [youtube] extractor.
+    text = f"{result.err}\n{result.out}"
+    return "Item does not exist!" in text and "[youtube" not in text
+
+
+def run_ytdlp(cmd: list[str], timeout: int, browser: str) -> CmdResult:
+    result = run_cmd(cmd, timeout)
+    if browser and result.code != 0 and cookie_keyring_failed(result):
+        log("cookies    could not read the browser keyring; continuing without cookies")
+        return run_cmd(without_auth(cmd), timeout)
+    return result
+
+
 def stop_process_group(proc: subprocess.Popen) -> None:
     try:
         os.killpg(proc.pid, signal.SIGTERM)
@@ -1038,7 +1067,7 @@ def probe_live(url: str, cookies: str, browser: str = "") -> tuple[str, str, str
     ]
     cmd += yt_auth_args(cookies, browser)
     cmd.append(url)
-    result = run_cmd(cmd, PROBE_TIMEOUT)
+    result = run_ytdlp(cmd, PROBE_TIMEOUT, browser)
     line = ""
     for raw in result.out.splitlines():
         if raw.strip():
@@ -1416,7 +1445,7 @@ def download(
         was_archived = archive_has_id(read_archive(archive_path), video_id)
         before = opus_files(output_dir)
         images_before = image_files(temp_dir) if want_cover else set()
-        result = run_cmd(cmd, timeout)
+        result = run_ytdlp(cmd, timeout, browser)
         text = result.out + "\n" + result.err
         printed = [line.strip() for line in result.out.splitlines() if line.strip()]
         wanted = "." + cfg["audio_format"].lower().lstrip(".")
@@ -2232,6 +2261,19 @@ def cmd_self_test() -> int:
     check("browser cookies win", yt_auth_args("/tmp/cookies.txt", "brave+gnomekeyring") == ["--cookies-from-browser", "brave+gnomekeyring"])
     check("cookie file", yt_auth_args("/tmp/cookies.txt", "") == ["--cookies", "/tmp/cookies.txt"])
     check("no auth args", yt_auth_args("", "") == [])
+    check(
+        "drop browser cookies",
+        without_auth(["yt-dlp", "--cookies-from-browser", "brave+gnomekeyring", "https://example"])
+        == ["yt-dlp", "https://example"],
+    )
+    check(
+        "keyring failure",
+        cookie_keyring_failed(CmdResult(1, "", "ERROR: Item does not exist!")),
+    )
+    check(
+        "missing video stays",
+        not cookie_keyring_failed(CmdResult(1, "", "ERROR: [youtube] abc: Item does not exist!")),
+    )
     youtube = Feed(
         "https://www.youtube.com/feeds/videos.xml?channel_id=UCIr4vkCsn0tdTW2xZ1jRG1g",
         "LiberalHivemind",
