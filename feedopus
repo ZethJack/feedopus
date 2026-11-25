@@ -1009,16 +1009,46 @@ def without_auth(cmd: list[str]) -> list[str]:
 
 
 def cookie_keyring_failed(result: CmdResult) -> bool:
-    # secretstorage raises "Item does not exist!" before yt-dlp talks to YouTube.
-    # A real missing video names the [youtube] extractor.
+    # secretstorage raises these before yt-dlp talks to YouTube. A locked
+    # login keyring says "Item is locked!" and a deleted item says
+    # "Item does not exist!". A real missing video names the [youtube] extractor.
     text = f"{result.err}\n{result.out}"
-    return "Item does not exist!" in text and "[youtube" not in text
+    if "[youtube" in text:
+        return False
+    return any(
+        message in text
+        for message in (
+            "Item does not exist!",
+            "Item is locked!",
+            "Collection is locked!",
+        )
+    )
+
+
+def cookie_player_rejected(result: CmdResult) -> bool:
+    # A signed-in session can be given a YouTube player the solver cannot run
+    # ("The page needs to be reloaded", or Deno dying on addOnDisposeCallback).
+    # The same video often extracts with no cookies. Upcoming livestreams and
+    # other extractor errors stay as they are.
+    text = f"{result.err}\n{result.out}"
+    return any(
+        message in text
+        for message in (
+            "The page needs to be reloaded",
+            "addOnDisposeCallback is not a function",
+        )
+    )
 
 
 def run_ytdlp(cmd: list[str], timeout: int, browser: str) -> CmdResult:
     result = run_cmd(cmd, timeout)
-    if browser and result.code != 0 and cookie_keyring_failed(result):
+    if not browser or result.code == 0:
+        return result
+    if cookie_keyring_failed(result):
         log("cookies    could not read the browser keyring; continuing without cookies")
+        return run_cmd(without_auth(cmd), timeout)
+    if cookie_player_rejected(result):
+        log("cookies    YouTube player could not be solved; continuing without cookies")
         return run_cmd(without_auth(cmd), timeout)
     return result
 
@@ -2271,8 +2301,34 @@ def cmd_self_test() -> int:
         cookie_keyring_failed(CmdResult(1, "", "ERROR: Item does not exist!")),
     )
     check(
+        "locked keyring item",
+        cookie_keyring_failed(CmdResult(1, "", "ERROR: Item is locked!")),
+    )
+    check(
+        "locked keyring collection",
+        cookie_keyring_failed(CmdResult(1, "", "ERROR: Collection is locked!")),
+    )
+    check(
         "missing video stays",
         not cookie_keyring_failed(CmdResult(1, "", "ERROR: [youtube] abc: Item does not exist!")),
+    )
+    check(
+        "player reload drops cookies",
+        cookie_player_rejected(
+            CmdResult(1, "", "ERROR: [youtube] w9e1D6OkffY: The page needs to be reloaded.")
+        ),
+    )
+    check(
+        "solver crash drops cookies",
+        cookie_player_rejected(
+            CmdResult(1, "", "TypeError: a.addOnDisposeCallback is not a function")
+        ),
+    )
+    check(
+        "upcoming livestream keeps cookies",
+        not cookie_player_rejected(
+            CmdResult(1, "", "ERROR: [youtube] abc: This live event will begin in 20 minutes.")
+        ),
     )
     youtube = Feed(
         "https://www.youtube.com/feeds/videos.xml?channel_id=UCIr4vkCsn0tdTW2xZ1jRG1g",
